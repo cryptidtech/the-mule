@@ -1,0 +1,537 @@
+use the_mule::config;
+use the_mule::docker_mgr;
+use the_mule::orchestrator;
+use the_mule::peer_monitor;
+use the_mule::peer_monitor::PeerEvent;
+use the_mule::redis_mgr;
+use the_mule::ssh_mgr;
+use the_mule::ui;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+use the_mule::config::{assign_peers, TestConfig};
+use the_mule::peer_monitor::PeerState;
+
+#[derive(Parser)]
+#[command(name = "tm")]
+#[command(about = "Orchestrate distributed peer integration tests")]
+struct Args {
+    /// Path to test YAML config
+    config: PathBuf,
+    /// Enable the ratatui TUI interface (default: console mode)
+    #[arg(long)]
+    tui: bool,
+    /// Print tracing log output to stderr (only in console mode, filtered by RUST_LOG)
+    #[arg(long)]
+    verbose: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let config: TestConfig = serde_yaml::from_reader(
+        File::open(&args.config).context("failed to open config file")?,
+    )
+    .context("failed to parse config YAML")?;
+
+    // Create log file
+    let now = chrono::Local::now();
+    let log_filename = format!(
+        "{}-{}.log",
+        config.test_name,
+        now.format("%Y-%m-%d-%H-%M-%S")
+    );
+    let log_file = File::create(&log_filename).context("failed to create log file")?;
+
+    // Configure tracing — file layer always present, optional stderr layer in console+verbose mode
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(log_file)
+        .with_ansi(false);
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env();
+
+    if !args.tui && args.verbose {
+        let console_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(true);
+        tracing_subscriber::registry()
+            .with(file_layer)
+            .with(console_layer)
+            .with(env_filter)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(file_layer)
+            .with(env_filter)
+            .init();
+    }
+
+    tracing::info!(
+        "Test started at {}, config: {}",
+        now,
+        args.config.display()
+    );
+
+    // Set up signal handler for graceful shutdown
+    let shutdown_token = CancellationToken::new();
+    let signal_shutdown = shutdown_token.clone();
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => { tracing::info!("received SIGINT (Ctrl+C)"); }
+            _ = sigterm.recv() => { tracing::info!("received SIGTERM"); }
+        }
+        signal_shutdown.cancel();
+    });
+
+    // Start local Redis container
+    console_print(!args.tui, "starting Redis...");
+    let redis_mgr =
+        redis_mgr::RedisManager::start(&config.redis).context("failed to start Redis")?;
+    let redis_client = redis_mgr
+        .client(config.redis.port)
+        .context("failed to create Redis client")?;
+    console_print(!args.tui, "Redis started");
+
+    // Wait a moment for Redis to be ready
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut redis_conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .context("failed to connect to Redis")?;
+
+    // Compute peer-to-host assignments (round-robin, unique ports)
+    let assignments = assign_peers(&config);
+
+    // Determine the local machine's IP for Redis URL
+    let redis_url = format!("redis://{}:{}", local_ip(), config.redis.port);
+    tracing::info!("Redis URL for peers: {redis_url}");
+
+    // Phase 1: Create SSH managers
+    console_print(!args.tui, "connecting to hosts via SSH...");
+    let mut ssh_managers: HashMap<String, ssh_mgr::SshManager> = HashMap::new();
+    for assignment in &assignments {
+        ssh_managers
+            .entry(assignment.host.address.clone())
+            .or_insert_with(|| {
+                ssh_mgr::SshManager::new(&assignment.host)
+                    .expect("failed to create SSH session")
+            });
+    }
+    console_print(
+        !args.tui,
+        &format!("connected to {} host(s)", ssh_managers.len()),
+    );
+
+    // Phase 2: Ensure Docker image is available on all remote hosts
+    docker_mgr::ensure_image_on_hosts(&config.docker_image, &ssh_managers, !args.tui)?;
+
+    // Phase 3: Start peer containers
+    console_print(!args.tui, "starting peer containers...");
+    for assignment in &assignments {
+        let docker_cmd = docker_mgr::start_peer(assignment, &redis_url, &config.docker_image, &ssh_managers)
+            .context(format!(
+                "failed to start peer {} on {}",
+                assignment.peer_name, assignment.host.address
+            ))?;
+        console_print(
+            !args.tui,
+            &format!(
+                "  started container: {} on {}\n    {}",
+                assignment.peer_name, assignment.host.address, docker_cmd
+            ),
+        );
+    }
+
+    // Shared state for peer statuses and identity info
+    let state = Arc::new(Mutex::new(PeerState::new()));
+    let cancel = CancellationToken::new();
+
+    // Create broadcast channel for console mode events
+    let event_tx = if !args.tui {
+        Some(tokio::sync::broadcast::channel::<PeerEvent>(256).0)
+    } else {
+        None
+    };
+
+    // Spawn per-peer monitor tasks
+    let peer_names: Vec<String> = config.peers.iter().map(|p| p.name.clone()).collect();
+    let mut monitor_handles = Vec::new();
+    for name in &peer_names {
+        let conn = redis_client
+            .get_multiplexed_async_connection()
+            .await
+            .context("failed to get Redis connection for monitor")?;
+        let handle = tokio::spawn(peer_monitor::monitor_peer(
+            name.clone(),
+            conn,
+            state.clone(),
+            cancel.clone(),
+            event_tx.clone(),
+        ));
+        monitor_handles.push(handle);
+    }
+
+    // Wait for all peers to report "started" (configurable timeout)
+    console_print(!args.tui, "waiting for all peers to start...");
+    tracing::info!("waiting for all peers to start...");
+    if let Err(e) = orchestrator::wait_for_peers_started(
+        &state,
+        &peer_names,
+        Duration::from_secs(config.timeout.startup),
+    )
+    .await
+    {
+        tracing::error!("peer startup failed: {e}");
+        console_print(!args.tui, &format!("ERROR: peer startup failed: {e}"));
+        orchestrator::shutdown_all_peers(&peer_names, &mut redis_conn).await;
+        cleanup(
+            cancel,
+            monitor_handles,
+            &assignments,
+            &ssh_managers,
+            &redis_mgr,
+        )
+        .await;
+        anyhow::bail!("peer startup failed: {e}");
+    }
+    tracing::info!("all peers started successfully");
+    console_print(!args.tui, "all peers started");
+
+    // Send bootstrap peer commands
+    orchestrator::send_bootstrap_commands(&config, &state, &mut redis_conn)
+        .await
+        .context("failed to send bootstrap commands")?;
+    console_print(!args.tui, "bootstrap commands sent");
+
+    // Build command batches
+    let mut batches = ui::build_batches(&config.commands, &assignments);
+
+    // Record test start time
+    let test_start = Instant::now();
+    tracing::info!("test timeline starting");
+    console_print(!args.tui, "test timeline starting");
+
+    // Run TUI or console mode
+    let result = if args.tui {
+        run_tui(
+            &config,
+            &assignments,
+            &mut batches,
+            &mut redis_conn,
+            &state,
+            test_start,
+            &shutdown_token,
+            &peer_names,
+        )
+        .await
+    } else {
+        run_console(
+            &config,
+            &mut batches,
+            &mut redis_conn,
+            &state,
+            test_start,
+            &shutdown_token,
+            &peer_names,
+            event_tx.as_ref().unwrap(),
+        )
+        .await
+    };
+
+    // Cleanup
+    cleanup(
+        cancel,
+        monitor_handles,
+        &assignments,
+        &ssh_managers,
+        &redis_mgr,
+    )
+    .await;
+
+    result
+}
+
+/// Send any due command batches, returning the updated batch index.
+async fn send_due_batches(
+    batches: &mut [ui::CommandBatch],
+    current_batch_idx: &mut usize,
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    test_start: Instant,
+    console_mode: bool,
+) {
+    while *current_batch_idx < batches.len() {
+        let target_time = Duration::from_secs(batches[*current_batch_idx].time);
+        if test_start.elapsed() >= target_time {
+            let batch = &batches[*current_batch_idx];
+            for cmd in &batch.commands {
+                let key = format!("{}_command", cmd.peer);
+                if let Err(e) =
+                    redis::AsyncCommands::lpush::<_, _, ()>(redis_conn, &key, &cmd.command).await
+                {
+                    tracing::warn!("failed to send command to {}: {e}", cmd.peer);
+                } else {
+                    let msg = format!(
+                        "[{:.1}s] sent to {}: {}",
+                        test_start.elapsed().as_secs_f64(),
+                        cmd.peer,
+                        cmd.command
+                    );
+                    tracing::info!("{msg}");
+                    console_print(console_mode, &msg);
+                }
+            }
+            batches[*current_batch_idx].sent = true;
+            batches[*current_batch_idx].sent_at = Some(Instant::now());
+            *current_batch_idx += 1;
+        } else {
+            break;
+        }
+    }
+}
+
+async fn run_tui(
+    config: &TestConfig,
+    assignments: &[config::PeerAssignment],
+    batches: &mut [ui::CommandBatch],
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    state: &Arc<Mutex<PeerState>>,
+    test_start: Instant,
+    shutdown_token: &CancellationToken,
+    peer_names: &[String],
+) -> Result<()> {
+    // Set up terminal for TUI
+    enable_raw_mode().context("failed to enable raw mode")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = ratatui::Terminal::new(backend).context("failed to create terminal")?;
+
+    let mut current_batch_idx: usize = 0;
+
+    let result = loop {
+        // Send any due command batches
+        send_due_batches(batches, &mut current_batch_idx, redis_conn, test_start, false).await;
+
+        // Render TUI
+        let statuses = {
+            let state = state.lock().await;
+            state.statuses.clone()
+        };
+        let elapsed = test_start.elapsed();
+
+        terminal.draw(|frame| {
+            ui::render(
+                frame,
+                &config.test_name,
+                elapsed,
+                &statuses,
+                assignments,
+                batches,
+                current_batch_idx,
+            );
+        })?;
+
+        // Check for user input (non-blocking, 100ms timeout)
+        if let Some(ui::InputEvent::Quit) = ui::poll_input(Duration::from_millis(100))? {
+            tracing::info!("user requested quit");
+            orchestrator::shutdown_all_peers(peer_names, redis_conn).await;
+            let _ = orchestrator::wait_for_peers_stopped(
+                state,
+                &peer_names.to_vec(),
+                Duration::from_secs(config.timeout.shutdown),
+            )
+            .await;
+            break Ok(());
+        }
+
+        // Check for signal-based shutdown
+        if shutdown_token.is_cancelled() {
+            tracing::info!("signal received, shutting down TUI");
+            orchestrator::shutdown_all_peers(peer_names, redis_conn).await;
+            let _ = orchestrator::wait_for_peers_stopped(
+                state,
+                &peer_names.to_vec(),
+                Duration::from_secs(config.timeout.shutdown),
+            )
+            .await;
+            break Ok(());
+        }
+
+        // Check if test is complete (all commands sent and all peers stopped)
+        if current_batch_idx >= batches.len() {
+            let all_stopped = {
+                let state = state.lock().await;
+                peer_names.iter().all(|name| {
+                    state
+                        .statuses
+                        .get(name)
+                        .map(|s| s == "stopped")
+                        .unwrap_or(false)
+                })
+            };
+            if all_stopped {
+                tracing::info!("all commands sent and all peers stopped — test complete");
+                break Ok(());
+            }
+        }
+    };
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+async fn run_console(
+    config: &TestConfig,
+    batches: &mut [ui::CommandBatch],
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    state: &Arc<Mutex<PeerState>>,
+    test_start: Instant,
+    shutdown_token: &CancellationToken,
+    peer_names: &[String],
+    event_tx: &tokio::sync::broadcast::Sender<PeerEvent>,
+) -> Result<()> {
+    let mut current_batch_idx: usize = 0;
+    let mut event_rx = event_tx.subscribe();
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+
+    loop {
+        tokio::select! {
+            // Branch 1: peer events
+            event = event_rx.recv() => {
+                match event {
+                    Ok(PeerEvent::StatusChange { peer, status }) => {
+                        println!("{peer}: {status}");
+                    }
+                    Ok(PeerEvent::LogEntry { peer, level, message }) => {
+                        if level == "error" || level == "warn" {
+                            eprintln!("[{level}] {peer}: {message}");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("console event receiver lagged by {n} messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+            // Branch 2: tick — send due commands and check completion
+            _ = tick.tick() => {
+                send_due_batches(batches, &mut current_batch_idx, redis_conn, test_start, true).await;
+
+                // Check if test is complete
+                if current_batch_idx >= batches.len() {
+                    let all_stopped = {
+                        let state = state.lock().await;
+                        peer_names.iter().all(|name| {
+                            state.statuses.get(name).map(|s| s == "stopped").unwrap_or(false)
+                        })
+                    };
+                    if all_stopped {
+                        println!("all commands sent and all peers stopped — test complete");
+                        tracing::info!("all commands sent and all peers stopped — test complete");
+                        return Ok(());
+                    }
+                }
+            }
+            // Branch 3: shutdown signal
+            _ = shutdown_token.cancelled() => {
+                println!("signal received, initiating shutdown...");
+                tracing::info!("signal received, initiating orderly shutdown");
+                orchestrator::shutdown_all_peers(peer_names, redis_conn).await;
+                println!("waiting up to {}s for peers to stop...", config.timeout.shutdown);
+                match orchestrator::wait_for_peers_stopped(
+                    state,
+                    &peer_names.to_vec(),
+                    Duration::from_secs(config.timeout.shutdown),
+                ).await {
+                    Ok(()) => println!("all peers stopped gracefully"),
+                    Err(e) => println!("shutdown timeout: {e} (force-stopping in cleanup)"),
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cleanup(
+    cancel: CancellationToken,
+    monitor_handles: Vec<tokio::task::JoinHandle<()>>,
+    assignments: &[config::PeerAssignment],
+    ssh_managers: &HashMap<String, ssh_mgr::SshManager>,
+    redis_mgr: &redis_mgr::RedisManager,
+) {
+    // Cancel all monitor tasks
+    cancel.cancel();
+    for h in monitor_handles {
+        let _ = h.await;
+    }
+
+    // Stop all peer containers via SSH
+    for assignment in assignments {
+        let _ = docker_mgr::stop_peer(
+            &assignment.peer_name,
+            &assignment.host.address,
+            ssh_managers,
+        );
+    }
+
+    // Stop Redis
+    let _ = redis_mgr.stop();
+}
+
+/// Print a message to stdout when in console mode.
+fn console_print(console_mode: bool, msg: &str) {
+    if console_mode {
+        println!("{msg}");
+    }
+}
+
+/// Get the local machine's IP address.
+/// Falls back to 127.0.0.1 if detection fails.
+fn local_ip() -> String {
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                return addr.ip().to_string();
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_ip_returns_dotted_string() {
+        let ip = local_ip();
+        assert!(!ip.is_empty());
+        assert!(ip.contains('.'), "expected dotted IP, got: {ip}");
+    }
+}

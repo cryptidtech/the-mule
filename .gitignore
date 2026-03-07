@@ -1,0 +1,67 @@
+# Rust / Cargo
+/target
+**/.target
+**/target/
+
+# Build scripts & codegen
+*.rs.bk
+*.swp
+*.swo
+
+# Rustfmt / Clippy
+rustfmt.json
+.clippy.toml
+rust-toolchain.toml
+rust-toolchain
+
+# Editor / IDE files
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-*
+*.iml
+
+# OS / filesystem noise
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Logs & temporary files
+*.log
+*.tmp
+*.bak
+*~
+
+# Profiling / tracing
+flamegraph.svg
+perf.data*
+callgrind.out.*
+cachegrind.out.*
+
+# Common test artifacts
+test-results/
+coverage/
+lcov.info
+
+# wasm / trunk / wasm-bindgen specific (if you do webassembly)
+dist/
+pkg/
+wasm-pack.log
+*-bg.wasm
+*-bg.wasm.d.ts
+
+# leptos / dioxus full-stack / tauri (very common in 2025+)
+node_modules/
+frontend/node_modules/
+dist-tauri/
+tauri/target/
+*.app/
+*.exe
+*.msi
+*.deb
+*.rpm
+
+# If you're using cargo-dist or other bundlers
+artifacts/
+release/

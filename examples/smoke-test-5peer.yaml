@@ -1,0 +1,76 @@
+# Smoke test: 5 peers on a single host
+#
+# Tests the full lifecycle:
+#   1. All 5 peers start and report "started"
+#   2. Bootstrap addresses are exchanged
+#   3. All peers connect to the Kademlia DHT
+#   4. alice pushes a message to bob
+#   5. bob pulls messages
+#   6. charlie does a key rotation
+#   7. dave disconnects and reconnects (restart with delay)
+#   8. eve tracks alice's VLAD
+#   9. All peers shut down cleanly
+
+test_name: "smoke-test-5peer"
+
+redis:
+  port: 6399
+  image: "redis:7-alpine"
+
+hosts:
+  - address: peer0
+    ssh_user: user
+    # path to key file (e.g. "~/.ssh/id_ed25519") or "agent" to use SSH_AUTH_SOCK
+    ssh_auth: agent
+
+docker_image: "vlademlia-test-peer:latest"
+base_port: 11984
+
+peers:
+  - name: alice
+    bootstrap: [bob, charlie]
+    env:
+      RUST_LOG: info
+  - name: bob
+    bootstrap: [alice]
+  - name: charlie
+    bootstrap: [alice, bob]
+  - name: dave
+    bootstrap: [alice, charlie]
+  - name: eve
+    bootstrap: [bob, dave]
+
+commands:
+  # t=0: everyone connects
+  - { time: 0,  peer: alice,   command: "connect" }
+  - { time: 0,  peer: bob,     command: "connect" }
+  - { time: 0,  peer: charlie, command: "connect" }
+  - { time: 0,  peer: dave,    command: "connect" }
+  - { time: 0,  peer: eve,     command: "connect" }
+
+  # t=10: alice pushes a message to bob
+  - { time: 10, peer: alice,   command: "push|bob|hello-from-alice" }
+
+  # t=15: bob pulls messages
+  - { time: 15, peer: bob,     command: "pull" }
+
+  # t=20: charlie rotates its key
+  - { time: 20, peer: charlie, command: "rotate-key" }
+
+  # t=25: eve tracks alice's VLAD (the actual VLAD string is resolved at runtime
+  #        via the peer command — here we just test the command path works;
+  #        the peer will log a warning if the VLAD can't be parsed)
+  - { time: 25, peer: eve,     command: "track|alice" }
+
+  # t=30: dave disconnects
+  - { time: 30, peer: dave,    command: "disconnect" }
+
+  # t=35: dave restarts with a 5-second delay
+  - { time: 35, peer: dave,    command: "restart|5" }
+
+  # t=55: shut everyone down
+  - { time: 55, peer: alice,   command: "shutdown" }
+  - { time: 55, peer: bob,     command: "shutdown" }
+  - { time: 55, peer: charlie, command: "shutdown" }
+  - { time: 55, peer: dave,    command: "shutdown" }
+  - { time: 55, peer: eve,     command: "shutdown" }
