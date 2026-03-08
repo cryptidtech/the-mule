@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 import queue
@@ -126,14 +125,11 @@ class MuleClient:
 
     async def __anext__(self) -> str:
         """Block until the next command is available, then return it as a raw string."""
-        while True:
-            result = await self._conn.blpop(self._command_key, timeout=1)
-            if result is not None:
-                _, value = result
-                if isinstance(value, bytes):
-                    return value.decode("utf-8")
-                return str(value)
-            await asyncio.sleep(0)
+        result = await self._conn.blpop(self._command_key, timeout=0)
+        _, value = result
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        return str(value)
 
     async def close(self) -> None:
         """Close the Redis connection and log handler."""

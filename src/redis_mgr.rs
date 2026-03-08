@@ -3,6 +3,21 @@ use std::process::Command;
 
 use crate::config::RedisConfig;
 
+/// Enable Redis keyspace notifications for string commands (SET).
+/// This allows subscribers to receive notifications on `__keyspace@0__:<key>` channels.
+pub async fn enable_keyspace_notifications(conn: &mut redis::aio::MultiplexedConnection) {
+    let result: redis::RedisResult<()> = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("notify-keyspace-events")
+        .arg("K$")
+        .query_async(conn)
+        .await;
+    match result {
+        Ok(()) => tracing::info!("enabled Redis keyspace notifications (K$)"),
+        Err(e) => tracing::warn!("failed to enable keyspace notifications: {e}"),
+    }
+}
+
 /// Manages a local Redis Docker container.
 pub struct RedisManager {
     container_name: String,

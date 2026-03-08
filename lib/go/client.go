@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -76,7 +75,7 @@ func (b *MuleClientBuilder) Build(ctx context.Context) (*MuleClient, error) {
 			default:
 			}
 
-			result, err := rdb.BLPop(childCtx, 1*time.Second, commandKey).Result()
+			result, err := rdb.BLPop(childCtx, 0, commandKey).Result()
 			if err != nil {
 				if err == context.Canceled {
 					return

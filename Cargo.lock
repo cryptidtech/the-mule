@@ -1371,6 +1371,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "futures-util",
  "predicates",
  "ratatui",
  "redis",

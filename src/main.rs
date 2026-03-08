@@ -129,6 +129,8 @@ async fn main() -> Result<()> {
         .await
         .context("failed to connect to Redis")?;
 
+    redis_mgr::enable_keyspace_notifications(&mut redis_conn).await;
+
     // Compute peer-to-host assignments (round-robin, unique ports)
     let assignments = assign_peers(&config);
 
@@ -210,13 +212,9 @@ async fn main() -> Result<()> {
     let peer_names: Vec<String> = config.peers.iter().map(|p| p.name.clone()).collect();
     let mut monitor_handles = Vec::new();
     for name in &peer_names {
-        let conn = redis_client
-            .get_multiplexed_async_connection()
-            .await
-            .context("failed to get Redis connection for monitor")?;
         let handle = tokio::spawn(peer_monitor::monitor_peer(
             name.clone(),
-            conn,
+            redis_client.clone(),
             state.clone(),
             cancel.clone(),
             event_tx.clone(),

@@ -40,63 +40,110 @@ async fn blpop(
     cmd.query_async(conn).await
 }
 
+/// Process a raw status string, updating shared state and broadcasting events.
+async fn process_status(
+    peer_name: &str,
+    raw_status: &str,
+    last_status: &mut Option<String>,
+    state: &Arc<Mutex<PeerState>>,
+    event_tx: &Option<tokio::sync::broadcast::Sender<PeerEvent>>,
+) {
+    if last_status.as_deref() == Some(raw_status) {
+        return;
+    }
+    *last_status = Some(raw_status.to_string());
+    let mut state = state.lock().await;
+    let parts: Vec<&str> = raw_status.splitn(3, '|').collect();
+    let status = parts[0].to_string();
+    state.statuses.insert(peer_name.to_string(), status.clone());
+    if parts.len() == 3 && parts[0] == "started" {
+        state.peer_info.insert(
+            peer_name.to_string(),
+            (parts[1].to_string(), parts[2].to_string()),
+        );
+    }
+    if let Some(ref tx) = event_tx {
+        let _ = tx.send(PeerEvent::StatusChange {
+            peer: peer_name.to_string(),
+            status,
+        });
+    }
+}
+
 /// Runs a monitor loop for a single peer.
-/// Polls <name>_status via GET every 200ms. Drains <name>_log via BLPOP with a short timeout.
+/// Subscribes to keyspace notifications for `<name>_status` and drains `<name>_log` via BLPOP.
 /// If `event_tx` is `Some`, broadcasts `PeerEvent`s for console mode.
 pub async fn monitor_peer(
     peer_name: String,
-    mut redis_conn: redis::aio::MultiplexedConnection,
+    redis_client: redis::Client,
     state: Arc<Mutex<PeerState>>,
     cancel: CancellationToken,
     event_tx: Option<tokio::sync::broadcast::Sender<PeerEvent>>,
 ) {
     let status_key = format!("{peer_name}_status");
     let log_key = format!("{peer_name}_log");
+    let channel = format!("__keyspace@0__:{status_key}");
 
+    // Create dedicated connections:
+    // - pubsub: for keyspace notification subscription
+    // - get_conn: for GET commands (triggered by notifications)
+    // - blpop_conn: for BLPOP log draining (blocks its TCP socket, must be separate)
+    let mut pubsub = redis_client
+        .get_async_pubsub()
+        .await
+        .expect("failed to create PubSub connection");
+    let mut get_conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("failed to create GET connection");
+    let mut blpop_conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("failed to create BLPOP connection");
+
+    // Subscribe FIRST (before initial GET) to avoid missing a SET
+    pubsub
+        .subscribe(&channel)
+        .await
+        .expect("failed to subscribe to keyspace notifications");
+
+    // Initial GET to catch status set before subscription
     let mut last_status: Option<String> = None;
-    let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(200));
+    let initial: redis::RedisResult<Option<String>> =
+        redis::AsyncCommands::get(&mut get_conn, &status_key).await;
+    if let Ok(Some(raw_status)) = initial {
+        process_status(&peer_name, &raw_status, &mut last_status, &state, &event_tx).await;
+    }
+
+    // Use into_on_message() to get an owned Stream (avoids borrow issues in select!)
+    let mut pubsub_stream = pubsub.into_on_message();
 
     loop {
-        if cancel.is_cancelled() {
-            break;
-        }
-
         tokio::select! {
             _ = cancel.cancelled() => break,
 
-            // Branch 1: poll status key via GET on interval
-            _ = poll_interval.tick() => {
-                let result: redis::RedisResult<Option<String>> =
-                    redis::AsyncCommands::get(&mut redis_conn, &status_key).await;
-                if let Ok(Some(raw_status)) = result {
-                    // Only process if the status value has changed
-                    if last_status.as_deref() != Some(&raw_status) {
-                        last_status = Some(raw_status.clone());
-
-                        let mut state = state.lock().await;
-                        let parts: Vec<&str> = raw_status.splitn(3, '|').collect();
-                        let status = parts[0].to_string();
-                        state.statuses.insert(peer_name.clone(), status.clone());
-
-                        if parts.len() == 3 && parts[0] == "started" {
-                            state.peer_info.insert(
-                                peer_name.clone(),
-                                (parts[1].to_string(), parts[2].to_string()),
-                            );
+            // Branch 1: keyspace notification — the status key was SET
+            msg = futures_util::StreamExt::next(&mut pubsub_stream) => {
+                match msg {
+                    Some(msg) => {
+                        let payload: String = msg.get_payload().unwrap_or_default();
+                        if payload == "set" {
+                            let result: redis::RedisResult<Option<String>> =
+                                redis::AsyncCommands::get(&mut get_conn, &status_key).await;
+                            if let Ok(Some(raw_status)) = result {
+                                process_status(&peer_name, &raw_status, &mut last_status, &state, &event_tx).await;
+                            }
                         }
-
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx.send(PeerEvent::StatusChange {
-                                peer: peer_name.clone(),
-                                status,
-                            });
-                        }
+                    }
+                    None => {
+                        tracing::error!(peer = %peer_name, "keyspace subscription stream ended");
+                        break;
                     }
                 }
             }
 
-            // Branch 2: drain log entries via BLPOP with 1s timeout
-            result = blpop(&mut redis_conn, &log_key, 1) => {
+            // Branch 2: drain log entries via BLPOP with timeout 0 (truly blocking)
+            result = blpop(&mut blpop_conn, &log_key, 0) => {
                 if let Ok(Some((_key, log_entry))) = result {
                     if let Some((level, message)) = log_entry.split_once('|') {
                         match level {
