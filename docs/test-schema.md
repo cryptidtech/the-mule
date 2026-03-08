@@ -8,9 +8,8 @@ This document describes the full YAML schema for `tm` test configuration files.
 |-------|------|----------|-------------|
 | `test_name` | string | yes | Name of the test run (used in log filenames and TUI header) |
 | `redis` | RedisConfig | yes | Local Redis container configuration |
+| `images` | list of string | no | Docker images to pre-pull locally before the test starts |
 | `hosts` | list of HostConfig | yes | Remote hosts to run peer containers on |
-| `docker_image` | string | yes | Docker image name for peer containers |
-| `base_port` | integer | yes | Starting UDP port for peer QUIC listeners |
 | `peers` | list of PeerConfig | yes | Peer definitions (may be empty) |
 | `commands` | list of TestCommand | yes | Timed command sequence |
 | `timeout` | TimeoutConfig | no | Startup/shutdown timeout overrides |
@@ -29,14 +28,16 @@ This document describes the full YAML schema for `tm` test configuration files.
 | `address` | string | yes | Hostname or IP of the remote host |
 | `ssh_user` | string | yes | SSH username |
 | `ssh_auth` | string | yes | `"agent"` to use SSH agent, or path to private key (e.g. `~/.ssh/id_ed25519`) |
+| `base_port` | integer | yes | Starting UDP port for peer QUIC listeners on this host |
 
 ## PeerConfig
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | yes | Unique peer name (used as container name suffix and Redis key prefix) |
+| `image` | string | yes | Docker image for this peer's container |
 | `bootstrap` | list of string | no | Names of peers to bootstrap from after startup |
-| `env` | map of string→string | no | Extra environment variables passed to the container |
+| `env` | map of string->string | no | Extra environment variables passed to the container |
 
 ## TestCommand
 
@@ -76,11 +77,11 @@ Peers are assigned to hosts as follows:
 
 1. Sort peers alphabetically by name
 2. Assign round-robin across the `hosts` list
-3. Each host gets a separate port counter starting at `base_port`
+3. Each host gets a separate port counter starting at its own `base_port`
 4. Each peer on a host gets the next available port
 
-For example, with 5 peers (alice, bob, charlie, dave, eve), 2 hosts, and
-`base_port: 11984`:
+For example, with 5 peers (alice, bob, charlie, dave, eve), 2 hosts (host-0
+with `base_port: 11984`, host-1 with `base_port: 11984`):
 
 | Peer | Host | Port |
 |------|------|------|
@@ -99,26 +100,32 @@ redis:
   port: 6399
   image: "redis:7-alpine"
 
+images:
+  - "ghcr.io/cryptidtech/rust-mule:latest"
+  - "ghcr.io/cryptidtech/python-mule:latest"
+  - "ghcr.io/cryptidtech/go-mule:latest"
+
 hosts:
-  - address: peer0
+  - address: localhost
     ssh_user: user
     ssh_auth: agent
-
-docker_image: "vlademlia-test-peer:latest"
-base_port: 11984
+    base_port: 11984
 
 peers:
   - name: alice
+    image: "ghcr.io/cryptidtech/rust-mule:latest"
     bootstrap: [bob, charlie]
-    env:
-      RUST_LOG: info
   - name: bob
+    image: "ghcr.io/cryptidtech/python-mule:latest"
     bootstrap: [alice]
   - name: charlie
+    image: "ghcr.io/cryptidtech/go-mule:latest"
     bootstrap: [alice, bob]
   - name: dave
+    image: "ghcr.io/cryptidtech/rust-mule:latest"
     bootstrap: [alice, charlie]
   - name: eve
+    image: "ghcr.io/cryptidtech/python-mule:latest"
     bootstrap: [bob, dave]
 
 commands:

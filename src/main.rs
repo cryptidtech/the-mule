@@ -39,6 +39,9 @@ struct Args {
     /// Print tracing log output to stderr (only in console mode, filtered by RUST_LOG)
     #[arg(long)]
     verbose: bool,
+    /// Use an external Redis instance instead of starting one (e.g. redis://host:6399)
+    #[arg(long)]
+    redis_url: Option<String>,
 }
 
 #[tokio::main]
@@ -100,17 +103,26 @@ async fn main() -> Result<()> {
         signal_shutdown.cancel();
     });
 
-    // Start local Redis container
-    console_print(!args.tui, "starting Redis...");
-    let redis_mgr =
-        redis_mgr::RedisManager::start(&config.redis).context("failed to start Redis")?;
-    let redis_client = redis_mgr
-        .client(config.redis.port)
-        .context("failed to create Redis client")?;
-    console_print(!args.tui, "Redis started");
-
-    // Wait a moment for Redis to be ready
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Start Redis (or connect to external instance)
+    let (redis_mgr, redis_client, redis_url) = if let Some(ref url) = args.redis_url {
+        console_print(!args.tui, &format!("using external Redis: {url}"));
+        let client = redis::Client::open(url.as_str())
+            .context("failed to create Redis client from --redis-url")?;
+        (None, client, url.clone())
+    } else {
+        console_print(!args.tui, "starting Redis...");
+        let mgr =
+            redis_mgr::RedisManager::start(&config.redis).context("failed to start Redis")?;
+        let client = mgr
+            .client(config.redis.port)
+            .context("failed to create Redis client")?;
+        let url = format!("redis://{}:{}", local_ip(), config.redis.port);
+        console_print(!args.tui, "Redis started");
+        // Wait a moment for Redis to be ready
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        (Some(mgr), client, url)
+    };
+    tracing::info!("Redis URL for peers: {redis_url}");
 
     let mut redis_conn = redis_client
         .get_multiplexed_async_connection()
@@ -119,10 +131,6 @@ async fn main() -> Result<()> {
 
     // Compute peer-to-host assignments (round-robin, unique ports)
     let assignments = assign_peers(&config);
-
-    // Determine the local machine's IP for Redis URL
-    let redis_url = format!("redis://{}:{}", local_ip(), config.redis.port);
-    tracing::info!("Redis URL for peers: {redis_url}");
 
     // Phase 1: Create SSH managers
     console_print(!args.tui, "connecting to hosts via SSH...");
@@ -140,13 +148,36 @@ async fn main() -> Result<()> {
         &format!("connected to {} host(s)", ssh_managers.len()),
     );
 
-    // Phase 2: Ensure Docker image is available on all remote hosts
-    docker_mgr::ensure_image_on_hosts(&config.docker_image, &ssh_managers, !args.tui)?;
+    // Pre-pull images listed in the config
+    if !config.images.is_empty() {
+        docker_mgr::pull_images(&config.images, !args.tui)?;
+    }
 
-    // Phase 3: Start peer containers
+    // Phase 2: Ensure Docker images are available on all remote hosts
+    let unique_images: std::collections::HashSet<&str> = assignments
+        .iter()
+        .map(|a| a.docker_image.as_str())
+        .collect();
+    for image in &unique_images {
+        docker_mgr::ensure_image_on_hosts(image, &ssh_managers, !args.tui)?;
+    }
+
+    // Phase 3: Clear stale Redis queues and start peer containers
+    console_print(!args.tui, "clearing stale Redis queues...");
+    for assignment in &assignments {
+        let command_key = format!("{}_command", assignment.peer_name);
+        let log_key = format!("{}_log", assignment.peer_name);
+        redis::AsyncCommands::del::<_, ()>(&mut redis_conn, &command_key)
+            .await
+            .context(format!("failed to DEL {command_key}"))?;
+        redis::AsyncCommands::del::<_, ()>(&mut redis_conn, &log_key)
+            .await
+            .context(format!("failed to DEL {log_key}"))?;
+    }
+
     console_print(!args.tui, "starting peer containers...");
     for assignment in &assignments {
-        let docker_cmd = docker_mgr::start_peer(assignment, &redis_url, &config.docker_image, &ssh_managers)
+        let docker_cmd = docker_mgr::start_peer(assignment, &redis_url, &ssh_managers)
             .context(format!(
                 "failed to start peer {} on {}",
                 assignment.peer_name, assignment.host.address
@@ -159,6 +190,10 @@ async fn main() -> Result<()> {
             ),
         );
     }
+
+    // Give containers a moment to initialize before spawning BLPOP monitors
+    console_print(!args.tui, "waiting for containers to initialize...");
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Shared state for peer statuses and identity info
     let state = Arc::new(Mutex::new(PeerState::new()));
@@ -207,7 +242,7 @@ async fn main() -> Result<()> {
             monitor_handles,
             &assignments,
             &ssh_managers,
-            &redis_mgr,
+            redis_mgr.as_ref(),
         )
         .await;
         anyhow::bail!("peer startup failed: {e}");
@@ -262,7 +297,7 @@ async fn main() -> Result<()> {
         monitor_handles,
         &assignments,
         &ssh_managers,
-        &redis_mgr,
+        redis_mgr.as_ref(),
     )
     .await;
 
@@ -325,6 +360,8 @@ async fn run_tui(
     let mut terminal = ratatui::Terminal::new(backend).context("failed to create terminal")?;
 
     let mut current_batch_idx: usize = 0;
+    let mut shutdown_sent = false;
+    let mut shutdown_started: Option<Instant> = None;
 
     let result = loop {
         // Send any due command batches
@@ -375,8 +412,15 @@ async fn run_tui(
             break Ok(());
         }
 
-        // Check if test is complete (all commands sent and all peers stopped)
+        // Auto-shutdown: once all commands are sent, send shutdown to all peers
         if current_batch_idx >= batches.len() {
+            if !shutdown_sent {
+                tracing::info!("all commands sent, sending shutdown to all peers");
+                orchestrator::shutdown_all_peers(peer_names, redis_conn).await;
+                shutdown_sent = true;
+                shutdown_started = Some(Instant::now());
+            }
+
             let all_stopped = {
                 let state = state.lock().await;
                 peer_names.iter().all(|name| {
@@ -390,6 +434,13 @@ async fn run_tui(
             if all_stopped {
                 tracing::info!("all commands sent and all peers stopped — test complete");
                 break Ok(());
+            }
+
+            if let Some(started) = shutdown_started {
+                if started.elapsed() > Duration::from_secs(config.timeout.shutdown) {
+                    tracing::warn!("shutdown timeout exceeded, exiting");
+                    break Ok(());
+                }
             }
         }
     };
@@ -415,6 +466,8 @@ async fn run_console(
     let mut current_batch_idx: usize = 0;
     let mut event_rx = event_tx.subscribe();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut shutdown_sent = false;
+    let mut shutdown_started: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -441,8 +494,16 @@ async fn run_console(
             _ = tick.tick() => {
                 send_due_batches(batches, &mut current_batch_idx, redis_conn, test_start, true).await;
 
-                // Check if test is complete
+                // Auto-shutdown: once all commands are sent, send shutdown to all peers
                 if current_batch_idx >= batches.len() {
+                    if !shutdown_sent {
+                        tracing::info!("all commands sent, sending shutdown to all peers");
+                        println!("all commands sent, sending shutdown to all peers...");
+                        orchestrator::shutdown_all_peers(peer_names, redis_conn).await;
+                        shutdown_sent = true;
+                        shutdown_started = Some(Instant::now());
+                    }
+
                     let all_stopped = {
                         let state = state.lock().await;
                         peer_names.iter().all(|name| {
@@ -450,9 +511,17 @@ async fn run_console(
                         })
                     };
                     if all_stopped {
-                        println!("all commands sent and all peers stopped — test complete");
+                        println!("all peers stopped — test complete");
                         tracing::info!("all commands sent and all peers stopped — test complete");
                         return Ok(());
+                    }
+
+                    if let Some(started) = shutdown_started {
+                        if started.elapsed() > Duration::from_secs(config.timeout.shutdown) {
+                            println!("shutdown timeout exceeded ({}s), exiting", config.timeout.shutdown);
+                            tracing::warn!("shutdown timeout exceeded, exiting");
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -483,7 +552,7 @@ async fn cleanup(
     monitor_handles: Vec<tokio::task::JoinHandle<()>>,
     assignments: &[config::PeerAssignment],
     ssh_managers: &HashMap<String, ssh_mgr::SshManager>,
-    redis_mgr: &redis_mgr::RedisManager,
+    redis_mgr: Option<&redis_mgr::RedisManager>,
 ) {
     // Cancel all monitor tasks
     cancel.cancel();
@@ -500,8 +569,10 @@ async fn cleanup(
         );
     }
 
-    // Stop Redis
-    let _ = redis_mgr.stop();
+    // Stop Redis (only if we started it)
+    if let Some(mgr) = redis_mgr {
+        let _ = mgr.stop();
+    }
 }
 
 /// Print a message to stdout when in console mode.

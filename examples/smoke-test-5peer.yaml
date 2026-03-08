@@ -1,15 +1,16 @@
-# Smoke test: 5 peers on a single host
+# Smoke test: 5 peers on a single host (heterogeneous images)
 #
-# Tests the full lifecycle:
-#   1. All 5 peers start and report "started"
-#   2. Bootstrap addresses are exchanged
-#   3. All peers connect to the Kademlia DHT
-#   4. alice pushes a message to bob
-#   5. bob pulls messages
-#   6. charlie does a key rotation
-#   7. dave disconnects and reconnects (restart with delay)
-#   8. eve tracks alice's VLAD
-#   9. All peers shut down cleanly
+# Tests the full lifecycle with Rust, Python, and Go reference peers:
+#   1. Pre-pull all three reference images
+#   2. All 5 peers start and report "started"
+#   3. Bootstrap addresses are exchanged
+#   4. All peers connect to the Kademlia DHT
+#   5. alice (Rust) pushes a message to bob (Python)
+#   6. bob (Python) pulls messages
+#   7. charlie (Go) does a key rotation
+#   8. eve (Python) tracks alice (Rust)
+#   9. dave (Rust) disconnects and restarts with delay
+#  10. All peers shut down cleanly
 
 test_name: "smoke-test-5peer"
 
@@ -17,28 +18,45 @@ redis:
   port: 6399
   image: "redis:7-alpine"
 
-hosts:
-  - address: peer0
-    ssh_user: user
-    # path to key file (e.g. "~/.ssh/id_ed25519") or "agent" to use SSH_AUTH_SOCK
-    ssh_auth: agent
+images:
+  - "ghcr.io/cryptidtech/rust-mule:latest"
+  - "ghcr.io/cryptidtech/python-mule:latest"
+  - "ghcr.io/cryptidtech/go-mule:latest"
 
-docker_image: "vlademlia-test-peer:latest"
-base_port: 11984
+hosts:
+  - address: localhost
+    ssh_user: user
+    ssh_auth: agent
+    base_port: 11984
 
 peers:
   - name: alice
+    image: "ghcr.io/cryptidtech/rust-mule:latest"
     bootstrap: [bob, charlie]
-    env:
+    environment:
       RUST_LOG: info
   - name: bob
+    image: "ghcr.io/cryptidtech/python-mule:latest"
     bootstrap: [alice]
+    environment:
+      LOGLEVEL: INFO
+      LOG_LEVEL: INFO
   - name: charlie
+    image: "ghcr.io/cryptidtech/go-mule:latest"
     bootstrap: [alice, bob]
+    environment:
+      LOG_LEVEL: info
   - name: dave
+    image: "ghcr.io/cryptidtech/rust-mule:latest"
     bootstrap: [alice, charlie]
+    environment:
+      RUST_LOG: info
   - name: eve
+    image: "ghcr.io/cryptidtech/python-mule:latest"
     bootstrap: [bob, dave]
+    environment:
+      LOGLEVEL: INFO
+      LOG_LEVEL: INFO
 
 commands:
   # t=0: everyone connects
@@ -48,29 +66,26 @@ commands:
   - { time: 0,  peer: dave,    command: "connect" }
   - { time: 0,  peer: eve,     command: "connect" }
 
-  # t=10: alice pushes a message to bob
+  # t=10: alice (Rust) pushes a message to bob (Python)
   - { time: 10, peer: alice,   command: "push|bob|hello-from-alice" }
 
-  # t=15: bob pulls messages
+  # t=15: bob (Python) pulls messages
   - { time: 15, peer: bob,     command: "pull" }
 
-  # t=20: charlie rotates its key
+  # t=20: charlie (Go) rotates its key
   - { time: 20, peer: charlie, command: "rotate-key" }
 
-  # t=25: eve tracks alice's VLAD (the actual VLAD string is resolved at runtime
-  #        via the peer command — here we just test the command path works;
-  #        the peer will log a warning if the VLAD can't be parsed)
-  - { time: 25, peer: eve,     command: "track|alice" }
+  # t=25: dave (Rust) restarts with 5s delay (tests exit-42 + entrypoint.sh)
+  - { time: 25, peer: dave,    command: "restart|5" }
 
-  # t=30: dave disconnects
-  - { time: 30, peer: dave,    command: "disconnect" }
+  # t=35: eve (Python) tracks alice (Rust)
+  - { time: 35, peer: eve,     command: "track|alice" }
 
-  # t=35: dave restarts with a 5-second delay
-  - { time: 35, peer: dave,    command: "restart|5" }
+  # t=40: dave (Rust) disconnects
+  - { time: 40, peer: dave,    command: "disconnect" }
 
-  # t=55: shut everyone down
-  - { time: 55, peer: alice,   command: "shutdown" }
-  - { time: 55, peer: bob,     command: "shutdown" }
-  - { time: 55, peer: charlie, command: "shutdown" }
-  - { time: 55, peer: dave,    command: "shutdown" }
-  - { time: 55, peer: eve,     command: "shutdown" }
+  # Automatic shutdown is sent to all peers when all commands are complete
+
+timeout:
+  startup: 60
+  shutdown: 30

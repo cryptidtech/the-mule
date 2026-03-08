@@ -1,0 +1,51 @@
+# Smoke test: 1 peer running the rust-mule image
+#
+test_name: "smoke-test-1-rust-peer"
+
+redis:
+  port: 6399
+  image: "redis:7-alpine"
+
+images:
+  - "ghcr.io/cryptidtech/rust-mule:latest"
+
+hosts:
+  - address: localhost
+    ssh_user: user
+    ssh_auth: agent
+    base_port: 11984
+
+peers:
+  - name: alice
+    image: "ghcr.io/cryptidtech/rust-mule:latest"
+    bootstrap: []
+    environment:
+      - RUST_LOG=info
+
+commands:
+  # t=0: alice connects
+  - { time: 0,  peer: alice, command: "connect" }
+
+  # t=10: alice pushes a message to alice
+  - { time: 10, peer: alice, command: "push|alice|hello-from-alice" }
+
+  # t=15: alice pull messages
+  - { time: 15, peer: alice, command: "pull" }
+
+  # t=20: alice rotates its key
+  - { time: 20, peer: alice, command: "rotate-key" }
+
+  # t=25: alice (Rust) restarts with 5s delay (tests exit-42 + entrypoint.sh)
+  - { time: 25, peer: alice, command: "restart|5" }
+
+  # t=35: alice tracks alice
+  - { time: 35, peer: alice, command: "track|alice" }
+
+  # t=40: alice disconnects
+  - { time: 40, peer: alice, command: "disconnect" }
+
+  # Automatic shutdown is sent to all peers when all commands are complete
+
+timeout:
+  startup: 60
+  shutdown: 30

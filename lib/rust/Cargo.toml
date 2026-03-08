@@ -1,0 +1,23 @@
+[package]
+name = "the_mule"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Client library for The Mule distributed test orchestrator"
+
+[lib]
+name = "the_mule"
+path = "src/lib.rs"
+
+[[bin]]
+name = "reference-peer"
+path = "src/bin/reference-peer.rs"
+
+[dependencies]
+redis = { version = "0.32", features = ["aio", "tokio-comp"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-core = "0.3"
+async-stream = "0.3"
+tokio-stream = "0.1"

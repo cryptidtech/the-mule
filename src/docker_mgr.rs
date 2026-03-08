@@ -255,12 +255,33 @@ pub fn ensure_image_on_hosts(
     Ok(())
 }
 
+/// Pull a list of Docker images locally. Bails on the first failure.
+pub fn pull_images(images: &[String], console_mode: bool) -> Result<()> {
+    for image in images {
+        console_print(console_mode, &format!("pulling Docker image '{image}'..."));
+        tracing::info!("pulling Docker image: {image}");
+
+        let output = Command::new("docker")
+            .args(["pull", image])
+            .output()
+            .context(format!("failed to run 'docker pull {image}'"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("docker pull '{image}' failed: {}", stderr.trim());
+        }
+
+        console_print(console_mode, &format!("  pulled '{image}'"));
+        tracing::info!("pulled Docker image: {image}");
+    }
+    Ok(())
+}
+
 /// Start a peer container on its assigned remote host via SSH.
 /// Returns the docker run command that was executed.
 pub fn start_peer(
     assignment: &PeerAssignment,
     redis_url: &str,
-    docker_image: &str,
     ssh_managers: &HashMap<String, SshManager>,
 ) -> Result<String> {
     let mgr = ssh_managers
@@ -301,12 +322,13 @@ pub fn start_peer(
         env_args.push_str(&format!(" -e {k}={v}"));
     }
 
+    let image = &assignment.docker_image;
     let cmd = format!(
         "docker run -d --name {container_name} \
          -v {config_dir}:/config \
          -p {port}:{port}/udp \
          {env_args} \
-         {docker_image}"
+         {image}"
     );
 
     let output = match mgr.exec(&cmd)? {

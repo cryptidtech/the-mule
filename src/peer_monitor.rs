@@ -41,7 +41,7 @@ async fn blpop(
 }
 
 /// Runs a monitor loop for a single peer.
-/// Alternates between BLPOP on <name>_status and <name>_log.
+/// Polls <name>_status via GET every 200ms. Drains <name>_log via BLPOP with a short timeout.
 /// If `event_tx` is `Some`, broadcasts `PeerEvent`s for console mode.
 pub async fn monitor_peer(
     peer_name: String,
@@ -53,41 +53,49 @@ pub async fn monitor_peer(
     let status_key = format!("{peer_name}_status");
     let log_key = format!("{peer_name}_log");
 
+    let mut last_status: Option<String> = None;
+    let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(200));
+
     loop {
         if cancel.is_cancelled() {
             break;
         }
 
-        // BLPOP on status key (1s timeout to allow cancel check)
         tokio::select! {
             _ = cancel.cancelled() => break,
-            result = blpop(&mut redis_conn, &status_key, 1) => {
-                if let Ok(Some((_key, raw_status))) = result {
-                    let mut state = state.lock().await;
-                    let parts: Vec<&str> = raw_status.splitn(3, '|').collect();
-                    let status = parts[0].to_string();
-                    state.statuses.insert(peer_name.clone(), status.clone());
 
-                    if parts.len() == 3 && parts[0] == "started" {
-                        state.peer_info.insert(
-                            peer_name.clone(),
-                            (parts[1].to_string(), parts[2].to_string()),
-                        );
-                    }
+            // Branch 1: poll status key via GET on interval
+            _ = poll_interval.tick() => {
+                let result: redis::RedisResult<Option<String>> =
+                    redis::AsyncCommands::get(&mut redis_conn, &status_key).await;
+                if let Ok(Some(raw_status)) = result {
+                    // Only process if the status value has changed
+                    if last_status.as_deref() != Some(&raw_status) {
+                        last_status = Some(raw_status.clone());
 
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.send(PeerEvent::StatusChange {
-                            peer: peer_name.clone(),
-                            status,
-                        });
+                        let mut state = state.lock().await;
+                        let parts: Vec<&str> = raw_status.splitn(3, '|').collect();
+                        let status = parts[0].to_string();
+                        state.statuses.insert(peer_name.clone(), status.clone());
+
+                        if parts.len() == 3 && parts[0] == "started" {
+                            state.peer_info.insert(
+                                peer_name.clone(),
+                                (parts[1].to_string(), parts[2].to_string()),
+                            );
+                        }
+
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(PeerEvent::StatusChange {
+                                peer: peer_name.clone(),
+                                status,
+                            });
+                        }
                     }
                 }
             }
-        }
 
-        // Drain any pending log entries
-        tokio::select! {
-            _ = cancel.cancelled() => break,
+            // Branch 2: drain log entries via BLPOP with 1s timeout
             result = blpop(&mut redis_conn, &log_key, 1) => {
                 if let Ok(Some((_key, log_entry))) = result {
                     if let Some((level, message)) = log_entry.split_once('|') {

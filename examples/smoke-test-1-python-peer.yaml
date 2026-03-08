@@ -1,0 +1,52 @@
+# Smoke test: 1 peer running the python-mule image
+#
+test_name: "smoke-test-1-python-peer"
+
+redis:
+  port: 6399
+  image: "redis:7-alpine"
+
+images:
+  - "ghcr.io/cryptidtech/python-mule:latest"
+
+hosts:
+  - address: localhost
+    ssh_user: user
+    ssh_auth: agent
+    base_port: 11984
+
+peers:
+  - name: bob
+    image: "ghcr.io/cryptidtech/python-mule:latest"
+    bootstrap: []
+    environment:
+      LOG_LEVEL: INFO
+      LOGLEVEL: INFO
+
+commands:
+  # t=0: bob connects
+  - { time: 0,  peer: bob, command: "connect" }
+
+  # t=10: bob pushes a message to bob
+  - { time: 10, peer: bob, command: "push|bob|hello-from-bob" }
+
+  # t=15: bob pull messages
+  - { time: 15, peer: bob, command: "pull" }
+
+  # t=20: bob rotates its key
+  - { time: 20, peer: bob, command: "rotate-key" }
+
+  # t=25: bob (Rust) restarts with 5s delay (tests exit-42 + entrypoint.sh)
+  - { time: 25, peer: bob, command: "restart|5" }
+
+  # t=35: bob tracks bob
+  - { time: 35, peer: bob, command: "track|bob" }
+
+  # t=40: bob disconnects
+  - { time: 40, peer: bob, command: "disconnect" }
+
+  # Automatic shutdown is sent to all peers when all commands are complete
+
+timeout:
+  startup: 60
+  shutdown: 30

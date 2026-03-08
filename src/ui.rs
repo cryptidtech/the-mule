@@ -353,10 +353,12 @@ mod tests {
                 address: "host0".to_string(),
                 ssh_user: "user".to_string(),
                 ssh_auth: "agent".to_string(),
+                base_port: 10000,
             },
             port: 10000,
             listen_addr: "/ip4/0.0.0.0/udp/10000/quic-v1".to_string(),
             extra_env: HashMap::new(),
+            docker_image: "test:latest".to_string(),
         }];
         let batches = build_batches(&commands, &assignments);
         assert_eq!(batches.len(), 2);
