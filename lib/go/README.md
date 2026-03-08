@@ -40,6 +40,18 @@ func main() {
 | `REDIS_URL` | yes | Redis connection URL |
 | `PEER_NAME` | yes | This peer's name |
 
+## How it works
+
+- **Commands**: a goroutine calls `BLPOP {peer}_command 0` (truly blocking, no
+  polling) and sends raw strings to a buffered Go channel. Context cancellation
+  is respected — when the context is cancelled or `Close()` is called, the
+  goroutine exits and the channel is closed. Go's M:N scheduler ensures the
+  blocking goroutine does not block your other goroutines.
+- **Logs**: a `slog.Handler` captures log records and forwards them to Redis
+  via `LPUSH {peer}_log "level|message"`.
+- **Status**: `SendStatus()` calls `SET {peer}_status <value>`, which triggers
+  a keyspace notification on the orchestrator side.
+
 ## API
 
 - `NewBuilder()` — reads env vars

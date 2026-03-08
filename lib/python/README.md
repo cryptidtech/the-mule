@@ -25,6 +25,8 @@ async def main():
             await client.send_status("stopped")
             break
 
+    await client.close()
+
 asyncio.run(main())
 ```
 
@@ -35,6 +37,16 @@ asyncio.run(main())
 | `REDIS_URL` | yes | Redis connection URL |
 | `PEER_NAME` | yes | This peer's name |
 | `LOG_LEVEL` | no | Python log level (e.g., `INFO`) |
+
+## How it works
+
+- **Commands**: the async iterator calls `BLPOP {peer}_command 0` (truly
+  blocking, no polling). Because `redis.asyncio` is used, the `await` yields
+  to the asyncio event loop so other coroutines run freely.
+- **Logs**: a `logging.Handler` captures log records and forwards them to Redis
+  via `LPUSH {peer}_log "level|message"` in a background thread.
+- **Status**: `send_status()` calls `SET {peer}_status <value>`, which triggers
+  a keyspace notification on the orchestrator side.
 
 ## API
 

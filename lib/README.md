@@ -4,7 +4,7 @@ Client libraries for peer applications to communicate with The Mule orchestrator
 
 ## Protocol
 
-All communication between the orchestrator and peer containers happens through Redis. Commands and logs use Redis lists (LPUSH/BLPOP). Status updates use a Redis string (SET/GET).
+All communication between the orchestrator and peer containers happens through Redis. Commands use Redis lists (LPUSH from orchestrator, BLPOP from peer). Logs use Redis lists (LPUSH from peer, BLPOP from orchestrator). Status updates use a Redis string (SET from peer; the orchestrator subscribes to keyspace notifications and then GETs the value).
 
 ### Redis Key Naming
 
@@ -15,6 +15,24 @@ For a peer named `alice`:
 | `alice_command` | orchestrator -> peer | Commands for the peer to execute |
 | `alice_status` | peer -> orchestrator | Status updates from the peer |
 | `alice_log` | peer -> orchestrator | Log entries from the peer |
+
+### How the orchestrator monitors peers
+
+The orchestrator uses **Redis keyspace notifications** to detect status changes
+instantly (no polling). On startup it runs:
+
+```
+CONFIG SET notify-keyspace-events K$
+```
+
+Each peer monitor subscribes to the channel `__keyspace@0__:{peer}_status`.
+When a peer calls `SET {peer}_status <value>`, Redis publishes a notification
+on that channel and the monitor fetches the new value via `GET`.
+
+Log entries are drained via `BLPOP {peer}_log 0` (truly blocking, no timeout).
+
+Peer-side code does not need to do anything special for this to work — plain
+`SET` on the status key and `LPUSH` on the log key is all that is required.
 
 ### Command Format
 
@@ -31,6 +49,9 @@ Commands are pipe-delimited strings pushed to `{peer}_command`:
 | rotate-key | `rotate-key` | Rotate the peer's signing key |
 | track | `track\|<peer>` | Start tracking another peer's VLAD |
 | peer | `peer\|<vlad>\|<multiaddr>` | Add a bootstrap peer |
+
+Peers receive commands by calling `BLPOP {peer}_command 0` (blocking until a
+command is available).
 
 ### Status Format
 
