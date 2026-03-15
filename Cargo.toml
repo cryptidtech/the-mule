@@ -14,23 +14,23 @@ name = "tm"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-redis = { version = "0.32", features = ["aio", "tokio-comp"] }
-ratatui = "0.29"
-crossterm = "0.28"
-ssh2 = "0.9"
-serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
-clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
 chrono = "0.4"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-tokio-util = { version = "0.7", features = ["rt"] }
+clap = { version = "4.0", features = ["derive"] }
+crossterm = "0.29"
 futures-util = "0.3"
+ratatui = "0.30"
+redis = { version = "1.0", features = ["aio", "tokio-comp"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+ssh2 = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-tempfile = "3.0"
 assert_cmd = "2.0"
 predicates = "3.0"
+tempfile = "3.0"
