@@ -1,3 +1,5 @@
+![The Mule](the_mule.jpeg)
+
 # The Mule (`tm`)
 
 A standalone test orchestration tool for running distributed peer integration
