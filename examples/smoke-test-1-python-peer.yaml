@@ -1,6 +1,10 @@
 # Smoke test: 1 peer running the python-mule image
 #
-test_name: "smoke-test-1-python-peer"
+name: "smoke-test-1-python-peer"
+
+timeout:
+  startup: 60
+  shutdown: 30
 
 redis:
   port: 6399
@@ -47,6 +51,3 @@ commands:
 
   # Automatic shutdown is sent to all peers when all commands are complete
 
-timeout:
-  startup: 60
-  shutdown: 30

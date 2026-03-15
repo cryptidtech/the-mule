@@ -1,6 +1,10 @@
 # Smoke test: 1 peer running the rust-mule image
 #
-test_name: "smoke-test-1-rust-peer"
+name: "smoke-test-1-rust-peer"
+
+timeout:
+  startup: 60
+  shutdown: 30
 
 redis:
   port: 6399
@@ -46,6 +50,3 @@ commands:
 
   # Automatic shutdown is sent to all peers when all commands are complete
 
-timeout:
-  startup: 60
-  shutdown: 30

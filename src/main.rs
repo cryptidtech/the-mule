@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
     let now = chrono::Local::now();
     let log_filename = format!(
         "{}-{}.log",
-        config.test_name,
+        config.name,
         now.format("%Y-%m-%d-%H-%M-%S")
     );
     let log_file = File::create(&log_filename).context("failed to create log file")?;
@@ -375,7 +375,7 @@ async fn run_tui(
         terminal.draw(|frame| {
             ui::render(
                 frame,
-                &config.test_name,
+                &config.name,
                 elapsed,
                 &statuses,
                 assignments,

@@ -9,7 +9,7 @@ fn parse_real_smoke_test_yaml() {
     let yaml = std::fs::read_to_string("examples/smoke-test-5peer.yaml")
         .expect("smoke-test-5peer.yaml should exist");
     let config: TestConfig = serde_yaml::from_str(&yaml).unwrap();
-    assert_eq!(config.test_name, "smoke-test-5peer");
+    assert_eq!(config.name, "smoke-test-5peer");
     assert_eq!(config.peers.len(), 5);
     assert_eq!(config.commands.len(), 11);
     assert_eq!(config.redis.port, 6399);
@@ -24,7 +24,7 @@ fn parse_real_smoke_test_yaml() {
 }
 
 #[test]
-fn missing_required_field_test_name() {
+fn missing_required_field_name() {
     let yaml = r#"
         redis:
           port: 6379
@@ -44,7 +44,7 @@ fn missing_required_field_test_name() {
 #[test]
 fn invalid_type_port_string() {
     let yaml = r#"
-        test_name: "test"
+        name: "test"
         redis:
           port: "not-a-number"
           image: "redis:7-alpine"
@@ -64,7 +64,7 @@ fn invalid_type_port_string() {
 fn empty_peers_is_valid() {
     let config = parse_config(
         r#"
-        test_name: "test"
+        name: "test"
         redis:
           port: 6379
           image: "redis:7-alpine"
@@ -84,7 +84,7 @@ fn empty_peers_is_valid() {
 fn peer_environment_is_optional() {
     let config = parse_config(
         r#"
-        test_name: "test"
+        name: "test"
         redis:
           port: 6379
           image: "redis:7-alpine"
@@ -111,7 +111,7 @@ fn peer_environment_is_optional() {
 fn peer_environment_list_syntax() {
     let config = parse_config(
         r#"
-        test_name: "test"
+        name: "test"
         redis:
           port: 6379
           image: "redis:7-alpine"
@@ -137,7 +137,7 @@ fn peer_environment_list_syntax() {
 fn default_timeout_values() {
     let config = parse_config(
         r#"
-        test_name: "test"
+        name: "test"
         redis:
           port: 6379
           image: "redis:7-alpine"
@@ -158,7 +158,9 @@ fn default_timeout_values() {
 fn partial_timeout_uses_defaults() {
     let config = parse_config(
         r#"
-        test_name: "test"
+        name: "test"
+        timeout:
+          startup: 120
         redis:
           port: 6379
           image: "redis:7-alpine"
@@ -169,8 +171,6 @@ fn partial_timeout_uses_defaults() {
             base_port: 10000
         peers: []
         commands: []
-        timeout:
-          startup: 120
         "#,
     );
     assert_eq!(config.timeout.startup, 120);
@@ -181,7 +181,7 @@ fn partial_timeout_uses_defaults() {
 fn images_field_deserialization() {
     let config = parse_config(
         r#"
-        test_name: "test"
+        name: "test"
         redis:
           port: 6379
           image: "redis:7-alpine"
@@ -208,7 +208,7 @@ fn images_field_deserialization() {
 fn per_peer_docker_image_in_assignment() {
     let config = parse_config(
         r#"
-        test_name: "test"
+        name: "test"
         redis:
           port: 6379
           image: "redis:7-alpine"

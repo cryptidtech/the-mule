@@ -76,7 +76,7 @@ pub fn format_elapsed(secs: u64) -> String {
 /// Render the TUI frame.
 pub fn render(
     frame: &mut Frame,
-    test_name: &str,
+    name: &str,
     elapsed: Duration,
     statuses: &BTreeMap<String, String>,
     assignments: &[PeerAssignment],
@@ -95,7 +95,7 @@ pub fn render(
         ])
         .split(area);
 
-    render_header(frame, chunks[0], test_name, elapsed);
+    render_header(frame, chunks[0], name, elapsed);
     render_peers(frame, chunks[1], statuses, assignments);
     render_commands(frame, chunks[2], batches, current_batch_idx, elapsed);
 }
@@ -106,17 +106,17 @@ fn peer_pane_height(peer_count: usize) -> u16 {
     (rows as u16) + 2
 }
 
-fn render_header(frame: &mut Frame, area: Rect, test_name: &str, elapsed: Duration) {
+fn render_header(frame: &mut Frame, area: Rect, name: &str, elapsed: Duration) {
     let elapsed_str = format_elapsed(elapsed.as_secs());
     let text = Line::from(vec![
         Span::styled(
-            format!(" The Mule: {test_name}"),
+            format!(" The Mule: {name}"),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
             "{:>width$}",
             elapsed_str,
-            width = area.width as usize - test_name.len() - 13
+            width = area.width as usize - name.len() - 13
         )),
     ]);
 

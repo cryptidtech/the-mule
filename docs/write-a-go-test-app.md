@@ -186,7 +186,11 @@ docker build -t my-go-peer:latest .
 
 ```yaml
 # my-test.yaml
-test_name: "my-go-peer-test"
+name: "my-go-peer-test"
+
+timeout:
+  startup: 60
+  shutdown: 30
 
 redis:
   port: 6399
@@ -211,10 +215,6 @@ commands:
   - { time: 0,  peer: bob,   command: "connect" }
   - { time: 10, peer: alice, command: "push|bob|hello" }
   - { time: 15, peer: bob,   command: "pull" }
-
-timeout:
-  startup: 60
-  shutdown: 30
 ```
 
 ## 6. Run the test

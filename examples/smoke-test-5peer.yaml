@@ -12,7 +12,11 @@
 #   9. dave (Rust) disconnects and restarts with delay
 #  10. All peers shut down cleanly
 
-test_name: "smoke-test-5peer"
+name: "smoke-test-5peer"
+
+timeout:
+  startup: 60
+  shutdown: 30
 
 redis:
   port: 6399
@@ -85,7 +89,3 @@ commands:
   - { time: 40, peer: dave,    command: "disconnect" }
 
   # Automatic shutdown is sent to all peers when all commands are complete
-
-timeout:
-  startup: 60
-  shutdown: 30

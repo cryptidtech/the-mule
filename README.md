@@ -7,6 +7,13 @@ tests across multiple hosts. Manages SSH connections, Docker image distribution,
 container lifecycle, Redis coordination, and provides both TUI and console
 interfaces for monitoring test execution.
 
+A test consists of a YAML file that defines the test name, timeout settings,
+the Redis server to use for command and control as well as log aggregation, the
+list of Docker images used by peers, the list of hosts that will run peers, and
+the peers themselves. After the configuration settings, there is a list of
+commands that are triggered at specific times to provide outside stimulus to
+the test to simulate a given scenario.
+
 ## Build
 
 ```sh

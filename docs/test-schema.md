@@ -6,13 +6,13 @@ This document describes the full YAML schema for `tm` test configuration files.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `test_name` | string | yes | Name of the test run (used in log filenames and TUI header) |
+| `name` | string | yes | Name of the test run (used in log filenames and TUI header) |
+| `timeout` | TimeoutConfig | no | Startup/shutdown timeout overrides |
 | `redis` | RedisConfig | yes | Local Redis container configuration |
 | `images` | list of string | no | Docker images to pre-pull locally before the test starts |
 | `hosts` | list of HostConfig | yes | Remote hosts to run peer containers on |
 | `peers` | list of PeerConfig | yes | Peer definitions (may be empty) |
 | `commands` | list of TestCommand | yes | Timed command sequence |
-| `timeout` | TimeoutConfig | no | Startup/shutdown timeout overrides |
 
 ## RedisConfig
 
@@ -94,7 +94,11 @@ with `base_port: 11984`, host-1 with `base_port: 11984`):
 ## Full example
 
 ```yaml
-test_name: "smoke-test-5peer"
+name: "smoke-test-5peer"
+
+timeout:
+  startup: 60
+  shutdown: 30
 
 redis:
   port: 6399
@@ -145,8 +149,4 @@ commands:
   - { time: 55, peer: charlie, command: "shutdown" }
   - { time: 55, peer: dave,    command: "shutdown" }
   - { time: 55, peer: eve,     command: "shutdown" }
-
-timeout:
-  startup: 60
-  shutdown: 30
 ```

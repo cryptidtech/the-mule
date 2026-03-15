@@ -1,6 +1,10 @@
 # Smoke test: 1 peer running the go-mule image
 #
-test_name: "smoke-test-1-go-peer"
+name: "smoke-test-1-go-peer"
+
+timeout:
+  startup: 60
+  shutdown: 30
 
 redis:
   port: 6399
@@ -46,6 +50,3 @@ commands:
 
   # Automatic shutdown is sent to all peers when all commands are complete
 
-timeout:
-  startup: 60
-  shutdown: 30

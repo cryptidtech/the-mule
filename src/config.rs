@@ -5,15 +5,15 @@ use std::fmt;
 
 #[derive(Deserialize, Clone)]
 pub struct TestConfig {
-    pub test_name: String,
+    pub name: String,
+    #[serde(default)]
+    pub timeout: TimeoutConfig,
     pub redis: RedisConfig,
     #[serde(default)]
     pub images: Vec<String>,
     pub hosts: Vec<HostConfig>,
     pub peers: Vec<PeerConfig>,
     pub commands: Vec<TestCommand>,
-    #[serde(default)]
-    pub timeout: TimeoutConfig,
 }
 
 #[derive(Deserialize, Clone)]
@@ -165,7 +165,7 @@ mod tests {
     fn minimal_config() -> TestConfig {
         serde_yaml::from_str(
             r#"
-            test_name: "test"
+            name: "test"
             redis:
               port: 6379
               image: "redis:7-alpine"
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn parse_minimal_config() {
         let config = minimal_config();
-        assert_eq!(config.test_name, "test");
+        assert_eq!(config.name, "test");
         assert_eq!(config.peers.len(), 2);
         assert_eq!(config.timeout.startup, 60);
         assert_eq!(config.timeout.shutdown, 30);
@@ -198,7 +198,7 @@ mod tests {
     fn parse_full_config_with_timeout() {
         let config: TestConfig = serde_yaml::from_str(
             r#"
-            test_name: "full"
+            name: "full"
             redis:
               port: 6399
               image: "redis:7-alpine"
@@ -225,7 +225,7 @@ mod tests {
     fn parse_config_with_images() {
         let config: TestConfig = serde_yaml::from_str(
             r#"
-            test_name: "test"
+            name: "test"
             redis:
               port: 6379
               image: "redis:7-alpine"
@@ -272,7 +272,7 @@ mod tests {
     fn round_robin_assignment_two_hosts() {
         let config: TestConfig = serde_yaml::from_str(
             r#"
-            test_name: "test"
+            name: "test"
             redis:
               port: 6379
               image: "redis:7-alpine"
@@ -314,7 +314,7 @@ mod tests {
     fn round_robin_two_hosts_different_base_ports() {
         let config: TestConfig = serde_yaml::from_str(
             r#"
-            test_name: "test"
+            name: "test"
             redis:
               port: 6379
               image: "redis:7-alpine"
@@ -358,7 +358,7 @@ mod tests {
     fn per_peer_image() {
         let config: TestConfig = serde_yaml::from_str(
             r#"
-            test_name: "test"
+            name: "test"
             redis:
               port: 6379
               image: "redis:7-alpine"

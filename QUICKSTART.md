@@ -86,7 +86,7 @@ The driver will:
 8. Wait up to 30s for all peers to report `stopped`
 9. Clean up all containers
 
-A log file is written to the current directory: `<test_name>-YYYY-MM-DD-HH-MM-SS.log`
+A log file is written to the current directory: `<name>-YYYY-MM-DD-HH-MM-SS.log`
 
 ### Console mode vs TUI mode
 
@@ -138,7 +138,11 @@ Test configs are YAML files. See [docs/test-schema.md](docs/test-schema.md)
 for the full schema reference. Here is a minimal example:
 
 ```yaml
-test_name: "my-test"
+name: "my-test"
+
+timeout:
+  startup: 60
+  shutdown: 30
 
 redis:
   port: 6399
@@ -163,10 +167,6 @@ commands:
   - { time: 0,  peer: bob,   command: "connect" }
   - { time: 10, peer: alice, command: "push|bob|hello" }
   - { time: 15, peer: bob,   command: "pull" }
-
-timeout:
-  startup: 60
-  shutdown: 30
 ```
 
 ### Multi-host setup
