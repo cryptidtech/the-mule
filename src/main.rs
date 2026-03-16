@@ -134,7 +134,14 @@ async fn main() -> Result<()> {
     // Compute peer-to-host assignments (round-robin, unique ports)
     let assignments = assign_peers(&config);
 
-    // Phase 1: Create SSH managers
+    // Build SSH connect info (lightweight, no connections yet)
+    let ssh_connect_infos: HashMap<String, ssh_mgr::SshConnectInfo> = config
+        .hosts
+        .iter()
+        .map(|h| (h.address.clone(), ssh_mgr::SshConnectInfo { host: h.clone() }))
+        .collect();
+
+    // Create SSH managers for later peer start/stop (still synchronous)
     console_print(!args.tui, "connecting to hosts via SSH...");
     let mut ssh_managers: HashMap<String, ssh_mgr::SshManager> = HashMap::new();
     for assignment in &assignments {
@@ -155,14 +162,8 @@ async fn main() -> Result<()> {
         docker_mgr::pull_images(&config.images, !args.tui)?;
     }
 
-    // Phase 2: Ensure Docker images are available on all remote hosts
-    let unique_images: std::collections::HashSet<&str> = assignments
-        .iter()
-        .map(|a| a.docker_image.as_str())
-        .collect();
-    for image in &unique_images {
-        docker_mgr::ensure_image_on_hosts(image, &ssh_managers, !args.tui)?;
-    }
+    // Distribute Docker images to hosts (async, maximally parallel)
+    docker_mgr::distribute_all_images(&assignments, &ssh_connect_infos, !args.tui).await?;
 
     // Phase 3: Clear stale Redis queues and start peer containers
     console_print(!args.tui, "clearing stale Redis queues...");

@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::PeerAssignment;
-use crate::ssh_mgr::{ExitStatus, SshManager};
+use crate::ssh_mgr::{ExitStatus, SshConnectInfo, SshManager};
 
 /// Print a message to stdout when in console mode.
 fn console_print(console_mode: bool, msg: &str) {
@@ -61,65 +61,50 @@ fn check_local_image(image: &str) -> Result<String> {
     Ok(image_id)
 }
 
-/// Check which remote hosts are missing or have a stale Docker image.
-/// Compares the local image ID against each remote host's image ID.
-/// Returns a list of host addresses that need the image.
-fn check_remote_hosts(
-    image: &str,
-    local_image_id: &str,
-    ssh_managers: &HashMap<String, SshManager>,
-    console_mode: bool,
-) -> Result<Vec<String>> {
-    tracing::info!("checking Docker image on {} remote host(s)", ssh_managers.len());
-    let mut missing = Vec::new();
-
-    for (host_addr, mgr) in ssh_managers {
-        let cmd = format!("docker image inspect --format '{{{{.Id}}}}' '{}'", image);
-        let (remote_id, exit_code) = mgr
-            .exec_with_status(&cmd)
-            .context(format!("failed to check image on {host_addr}"))?;
-
-        if exit_code != 0 {
-            tracing::info!("image '{}' missing on {}", image, host_addr);
-            console_print(console_mode, &format!("  {host_addr}: image missing"));
-            missing.push(host_addr.clone());
-        } else {
-            let remote_id = remote_id.trim();
-            if remote_id == local_image_id {
-                tracing::info!("image '{}' present on {} (ID matches)", image, host_addr);
-                console_print(console_mode, &format!("  {host_addr}: present ({remote_id})"));
-            } else {
-                tracing::info!(
-                    "image '{}' stale on {} (local={}, remote={})",
-                    image, host_addr, local_image_id, remote_id
-                );
-                console_print(console_mode, &format!("  {host_addr}: stale ({remote_id}), needs update"));
-                missing.push(host_addr.clone());
-            }
-        }
-    }
-
-    // Ensure ~/peer-config directory exists on all remote hosts
-    for (host_addr, mgr) in ssh_managers {
-        match mgr.exec("mkdir -p ~/peer-config")? {
-            ExitStatus::Success(_) => {}
-            ExitStatus::Failed(err) => {
-                tracing::error!("failed to create ~/peer-config on {host_addr}: {err}");
-                anyhow::bail!("failed to create ~/peer-config on {host_addr}: {err}");
-            }
-        }
-    }
-
-    Ok(missing)
+/// Per-image distribution plan: which hosts are missing this image.
+struct ImagePlan {
+    image: String,
+    missing_hosts: Vec<String>,
+    archive_path: PathBuf,
 }
 
-/// Export a Docker image to a gzipped tar archive.
-fn export_image(image: &str, archive_path: &Path, console_mode: bool) -> Result<()> {
+/// Check if a remote host is missing or has a stale Docker image.
+/// Returns `Some(host_addr)` if the host needs the image, `None` otherwise.
+fn check_remote_image_blocking(
+    connect_info: &SshConnectInfo,
+    image: &str,
+    local_id: &str,
+) -> Result<Option<String>> {
+    let host_addr = &connect_info.host.address;
+    let mgr = connect_info.connect()
+        .context(format!("failed to connect to {host_addr} for image check"))?;
+
+    let cmd = format!("docker image inspect --format '{{{{.Id}}}}' '{}'", image);
+    let (remote_id, exit_code) = mgr
+        .exec_with_status(&cmd)
+        .context(format!("failed to check image on {host_addr}"))?;
+
+    if exit_code != 0 {
+        tracing::info!("image '{}' missing on {}", image, host_addr);
+        Ok(Some(host_addr.clone()))
+    } else {
+        let remote_id = remote_id.trim();
+        if remote_id == local_id {
+            tracing::info!("image '{}' present on {} (ID matches)", image, host_addr);
+            Ok(None)
+        } else {
+            tracing::info!(
+                "image '{}' stale on {} (local={}, remote={})",
+                image, host_addr, local_id, remote_id
+            );
+            Ok(Some(host_addr.clone()))
+        }
+    }
+}
+
+/// Export a Docker image to a gzipped tar archive (blocking).
+fn export_image_blocking(image: &str, archive_path: &Path) -> Result<()> {
     tracing::info!("exporting Docker image '{}' to {}", image, archive_path.display());
-    console_print(
-        console_mode,
-        &format!("exporting Docker image '{image}' to local archive..."),
-    );
 
     let cmd = format!(
         "docker save '{}' | gzip > '{}'",
@@ -133,38 +118,47 @@ fn export_image(image: &str, archive_path: &Path, console_mode: bool) -> Result<
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("docker save failed: {}", stderr.trim());
+        anyhow::bail!("docker save failed for '{}': {}", image, stderr.trim());
     }
 
     let size_mb = std::fs::metadata(archive_path)?.len() as f64 / (1024.0 * 1024.0);
-    tracing::info!("image archive size: {:.1} MB", size_mb);
-    console_print(console_mode, &format!("  archive size: {size_mb:.1} MB"));
+    tracing::info!("image '{}' archive size: {:.1} MB", image, size_mb);
 
     Ok(())
 }
 
-/// Transfer the image archive to a remote host and load it.
-fn transfer_and_load(
-    mgr: &SshManager,
-    host_addr: &str,
+/// Transfer an image archive to a remote host via SCP (blocking).
+fn transfer_blocking(
+    connect_info: &SshConnectInfo,
     local_archive: &Path,
     remote_archive: &Path,
-    console_mode: bool,
 ) -> Result<()> {
+    let host_addr = &connect_info.host.address;
     tracing::info!("transferring image to {host_addr}...");
-    console_print(console_mode, &format!("  transferring image to {host_addr}..."));
 
+    let mgr = connect_info.connect()
+        .context(format!("failed to connect to {host_addr} for transfer"))?;
     mgr.scp_send_file(local_archive, remote_archive)
         .context(format!("failed to SCP image to {host_addr}"))?;
 
+    Ok(())
+}
+
+/// Load an image archive on a remote host and clean up (blocking).
+fn import_and_cleanup_blocking(
+    connect_info: &SshConnectInfo,
+    remote_archive: &Path,
+) -> Result<()> {
+    let host_addr = &connect_info.host.address;
     tracing::info!("loading image on {host_addr}...");
-    console_print(console_mode, &format!("  loading image on {host_addr}..."));
+
+    let mgr = connect_info.connect()
+        .context(format!("failed to connect to {host_addr} for import"))?;
 
     let load_cmd = format!("docker load -i '{}'", remote_archive.display());
     match mgr.exec(&load_cmd)? {
         ExitStatus::Success(_) => {}
         ExitStatus::Failed(err) => {
-            tracing::error!("failed to load image on {host_addr}: {err}");
             anyhow::bail!("failed to load image on {host_addr}: {err}");
         }
     }
@@ -173,84 +167,266 @@ fn transfer_and_load(
     match mgr.exec(&rm_cmd)? {
         ExitStatus::Success(_) => {}
         ExitStatus::Failed(err) => {
-            tracing::error!("failed to cleanup archive on {host_addr}: {err}");
             anyhow::bail!("failed to cleanup archive on {host_addr}: {err}");
         }
     }
 
     tracing::info!("image loaded on {host_addr}");
-    console_print(console_mode, &format!("  image loaded on {host_addr}"));
+    Ok(())
+}
+
+/// Ensure ~/peer-config directory exists on all remote hosts, in parallel.
+async fn ensure_peer_config_dirs(
+    ssh_connect_infos: &HashMap<String, SshConnectInfo>,
+) -> Result<()> {
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for (host_addr, info) in ssh_connect_infos {
+        let info = info.clone();
+        let host_addr = host_addr.clone();
+        join_set.spawn(tokio::task::spawn_blocking(move || -> Result<()> {
+            let mgr = info.connect()
+                .context(format!("failed to connect to {host_addr} for mkdir"))?;
+            match mgr.exec("mkdir -p ~/peer-config")? {
+                ExitStatus::Success(_) => Ok(()),
+                ExitStatus::Failed(err) => {
+                    anyhow::bail!("failed to create ~/peer-config on {host_addr}: {err}");
+                }
+            }
+        }));
+    }
+
+    let mut errors = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => errors.push(format!("{e}")),
+            Ok(Err(e)) => errors.push(format!("task panic: {e}")),
+            Err(e) => errors.push(format!("join error: {e}")),
+        }
+    }
+
+    if !errors.is_empty() {
+        anyhow::bail!("failed to ensure peer-config dirs:\n  {}", errors.join("\n  "));
+    }
+    Ok(())
+}
+
+/// Phase 1: Check local and remote images in parallel, build distribution plans.
+async fn plan_distribution(
+    image_hosts: &HashMap<String, HashSet<String>>,
+    ssh_connect_infos: &HashMap<String, SshConnectInfo>,
+) -> Result<Vec<ImagePlan>> {
+    // Check all local images in parallel
+    let mut local_set = tokio::task::JoinSet::new();
+    for image in image_hosts.keys() {
+        let image = image.clone();
+        local_set.spawn(tokio::task::spawn_blocking(move || -> Result<(String, String)> {
+            let id = check_local_image(&image)?;
+            Ok((image, id))
+        }));
+    }
+
+    let mut local_ids: HashMap<String, String> = HashMap::new();
+    while let Some(result) = local_set.join_next().await {
+        let (image, id) = result???;
+        local_ids.insert(image, id);
+    }
+
+    // Check all (image, host) pairs in parallel
+    let mut remote_set = tokio::task::JoinSet::new();
+    for (image, hosts) in image_hosts {
+        let local_id = local_ids[image].clone();
+        for host_addr in hosts {
+            let info = ssh_connect_infos[host_addr].clone();
+            let image = image.clone();
+            let local_id = local_id.clone();
+            remote_set.spawn(tokio::task::spawn_blocking(move || -> Result<(String, Option<String>)> {
+                let missing = check_remote_image_blocking(&info, &image, &local_id)?;
+                Ok((image, missing))
+            }));
+        }
+    }
+
+    // Collect missing hosts per image
+    let mut missing_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut errors = Vec::new();
+    while let Some(result) = remote_set.join_next().await {
+        match result {
+            Ok(Ok(Ok((image, Some(host))))) => {
+                missing_map.entry(image).or_default().push(host);
+            }
+            Ok(Ok(Ok((_, None)))) => {} // host has image, skip
+            Ok(Ok(Err(e))) => errors.push(format!("{e}")),
+            Ok(Err(e)) => errors.push(format!("task panic: {e}")),
+            Err(e) => errors.push(format!("join error: {e}")),
+        }
+    }
+
+    if !errors.is_empty() {
+        anyhow::bail!("failed during remote image checks:\n  {}", errors.join("\n  "));
+    }
+
+    // Build plans for images that have at least one missing host
+    let plans: Vec<ImagePlan> = missing_map
+        .into_iter()
+        .map(|(image, missing_hosts)| {
+            let archive_path = temp_archive_path(&image);
+            ImagePlan {
+                image,
+                missing_hosts,
+                archive_path,
+            }
+        })
+        .collect();
+
+    Ok(plans)
+}
+
+/// Phase 2: Export images and transfer/import to missing hosts in parallel.
+async fn distribute_images(
+    plans: Vec<ImagePlan>,
+    ssh_connect_infos: &HashMap<String, SshConnectInfo>,
+) -> Result<()> {
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for plan in &plans {
+        // Create a watch channel to signal export completion
+        let (export_tx, export_rx) = tokio::sync::watch::channel(false);
+
+        // Spawn export task
+        let image = plan.image.clone();
+        let archive_path = plan.archive_path.clone();
+        join_set.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                export_image_blocking(&image, &archive_path)
+            }).await?;
+            if result.is_ok() {
+                let _ = export_tx.send(true);
+            }
+            result
+        });
+
+        // Spawn transfer+import tasks for each missing host
+        for host_addr in &plan.missing_hosts {
+            let mut rx = export_rx.clone();
+            let info = ssh_connect_infos[host_addr].clone();
+            let local_archive = plan.archive_path.clone();
+            let image_name = plan.image.clone();
+            let remote_archive = PathBuf::from(format!(
+                "/tmp/tm-image-{}.tar.gz",
+                sanitize_image_name(&image_name)
+            ));
+            let host = host_addr.clone();
+
+            join_set.spawn(async move {
+                // Wait for export to complete
+                rx.wait_for(|done| *done).await.map_err(|_| {
+                    anyhow::anyhow!("export of '{}' was cancelled, skipping transfer to {}", image_name, host)
+                })?;
+
+                // Transfer
+                let info_clone = info.clone();
+                let la = local_archive.clone();
+                let ra = remote_archive.clone();
+                tokio::task::spawn_blocking(move || {
+                    transfer_blocking(&info_clone, &la, &ra)
+                }).await??;
+
+                // Import and cleanup
+                let ra = remote_archive;
+                tokio::task::spawn_blocking(move || {
+                    import_and_cleanup_blocking(&info, &ra)
+                }).await??;
+
+                tracing::info!("image '{}' distributed to {}", image_name, host);
+                Ok(())
+            });
+        }
+    }
+
+    // Drain all tasks, collect errors
+    let mut errors = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => errors.push(format!("{e}")),
+            Err(e) => errors.push(format!("join error: {e}")),
+        }
+    }
+
+    // Clean up local archives
+    for plan in &plans {
+        if plan.archive_path.exists() {
+            let _ = std::fs::remove_file(&plan.archive_path);
+        }
+    }
+
+    if !errors.is_empty() {
+        anyhow::bail!("image distribution errors:\n  {}", errors.join("\n  "));
+    }
 
     Ok(())
 }
 
-/// Ensure the Docker image is available on all remote hosts.
+/// Distribute all Docker images to remote hosts using a parallel async pipeline.
 ///
-/// 1. Verifies image exists locally (bails with build instructions if not)
-/// 2. Checks each remote host for the image
-/// 3. If any hosts are missing it, exports locally and SCPs to each
-pub fn ensure_image_on_hosts(
-    docker_image: &str,
-    ssh_managers: &HashMap<String, SshManager>,
+/// 1. Derives unique (image, set_of_hosts) pairs from assignments
+/// 2. Checks local+remote images in parallel
+/// 3. Ensures ~/peer-config dirs exist on all hosts
+/// 4. Runs export→transfer→import pipeline with maximum parallelism
+pub async fn distribute_all_images(
+    assignments: &[PeerAssignment],
+    ssh_connect_infos: &HashMap<String, SshConnectInfo>,
     console_mode: bool,
 ) -> Result<()> {
-    tracing::info!("ensuring Docker image '{}' is available on all hosts", docker_image);
-    console_print(console_mode, &format!("checking Docker image '{docker_image}'..."));
+    // Derive unique (image, set_of_hosts) from assignments
+    let mut image_hosts: HashMap<String, HashSet<String>> = HashMap::new();
+    for a in assignments {
+        image_hosts
+            .entry(a.docker_image.clone())
+            .or_default()
+            .insert(a.host.address.clone());
+    }
 
-    // 1. Check local and get image ID
-    let local_image_id = check_local_image(docker_image)?;
-    console_print(console_mode, &format!("  local image: present ({local_image_id})"));
-
-    // 2. Check remote hosts (compare image IDs)
-    let missing_hosts = check_remote_hosts(docker_image, &local_image_id, ssh_managers, console_mode)?;
-
-    if missing_hosts.is_empty() {
-        tracing::info!("Docker image present on all remote hosts");
-        console_print(console_mode, "Docker image present on all remote hosts");
+    if image_hosts.is_empty() {
         return Ok(());
     }
 
+    console_print(console_mode, "checking Docker images...");
+
+    // Phase 1: plan distribution (parallel checks)
+    let plans = plan_distribution(&image_hosts, ssh_connect_infos).await?;
+
+    // Ensure peer-config dirs exist on all hosts
+    ensure_peer_config_dirs(ssh_connect_infos).await?;
+
+    if plans.is_empty() {
+        tracing::info!("all Docker images present on all remote hosts");
+        console_print(console_mode, "all Docker images present on all remote hosts");
+        return Ok(());
+    }
+
+    let total_missing: usize = plans.iter().map(|p| p.missing_hosts.len()).sum();
     tracing::info!(
-        "image missing on {} host(s), distributing...",
-        missing_hosts.len()
+        "distributing {} image(s) to {} host target(s)...",
+        plans.len(),
+        total_missing
     );
     console_print(
         console_mode,
         &format!(
-            "image missing on {} host(s), distributing...",
-            missing_hosts.len()
+            "distributing {} image(s) to {} host target(s)...",
+            plans.len(),
+            total_missing
         ),
     );
 
-    // 3. Export image locally
-    let archive_path = temp_archive_path(docker_image);
-    export_image(docker_image, &archive_path, console_mode)?;
+    // Phase 2: export → transfer → import pipeline
+    distribute_images(plans, ssh_connect_infos).await?;
 
-    // 4. Transfer to each missing host, always cleaning up archive afterward
-    let remote_archive = PathBuf::from(format!(
-        "/tmp/tm-image-{}.tar.gz",
-        sanitize_image_name(docker_image)
-    ));
-
-    let result = (|| -> Result<()> {
-        for host_addr in &missing_hosts {
-            let mgr = ssh_managers
-                .get(host_addr)
-                .expect("SSH manager must exist for missing host");
-            transfer_and_load(mgr, host_addr, &archive_path, &remote_archive, console_mode)?;
-        }
-        Ok(())
-    })();
-
-    // Always clean up local archive
-    if archive_path.exists() {
-        let _ = std::fs::remove_file(&archive_path);
-    }
-
-    result?;
-
-    tracing::info!("Docker image distributed to all hosts");
-    console_print(console_mode, "Docker image distributed to all hosts");
+    tracing::info!("Docker image distribution complete");
+    console_print(console_mode, "Docker image distribution complete");
 
     Ok(())
 }

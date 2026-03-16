@@ -15,6 +15,19 @@ pub enum ExitStatus {
     Failed(String),
 }
 
+/// Lightweight connection parameters that are Clone + Send + Sync.
+/// Used to create fresh SshManager instances inside spawn_blocking tasks.
+#[derive(Clone)]
+pub struct SshConnectInfo {
+    pub host: HostConfig,
+}
+
+impl SshConnectInfo {
+    pub fn connect(&self) -> Result<SshManager> {
+        SshManager::new(&self.host)
+    }
+}
+
 /// Manages SSH connections and remote Docker container operations on a single host.
 pub struct SshManager {
     session: Session,
