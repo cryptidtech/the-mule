@@ -10,6 +10,8 @@ This document describes the full YAML schema for `tm` test configuration files.
 | `timeout` | TimeoutConfig | no | Startup/shutdown timeout overrides |
 | `redis` | RedisConfig | yes | Local Redis container configuration |
 | `images` | list of string | no | Docker images to pre-pull locally before the test starts |
+| `remove_images` | boolean | no | If `true`, remove images listed in `images` from all hosts after the test completes (default: `false`) |
+| `peer_environment` | map or list | no | Environment variables applied to **all** peers. Peer-level `environment` values override these. Supports map (`KEY: VALUE`) or list (`- KEY=VALUE`) syntax. |
 | `hosts` | list of HostConfig | yes | Remote hosts to run peer containers on |
 | `peers` | list of PeerConfig | yes | Peer definitions (may be empty) |
 | `commands` | list of TestCommand | yes | Timed command sequence |
@@ -26,9 +28,11 @@ This document describes the full YAML schema for `tm` test configuration files.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `address` | string | yes | Hostname or IP of the remote host |
+| `name` | string | no | Human-readable display name for the host (defaults to `address`) |
 | `ssh_user` | string | yes | SSH username |
 | `ssh_auth` | string | yes | `"agent"` to use SSH agent, or path to private key (e.g. `~/.ssh/id_ed25519`) |
 | `base_port` | integer | yes | Starting UDP port for peer QUIC listeners on this host |
+| `tags` | list of string | no | Tags for peer-to-host matching (see `runs_on` below) |
 
 ## PeerConfig
 
@@ -37,7 +41,8 @@ This document describes the full YAML schema for `tm` test configuration files.
 | `name` | string | yes | Unique peer name (used as container name suffix and Redis key prefix) |
 | `image` | string | yes | Docker image for this peer's container |
 | `bootstrap` | list of string | no | Names of peers to bootstrap from after startup |
-| `env` | map of string->string | no | Extra environment variables passed to the container |
+| `environment` | map of string->string | no | Extra environment variables passed to the container (overrides `peer_environment`) |
+| `runs_on` | string or list of string | no | Host tag(s) required for this peer. Accepts a single string (`"gpu"`) or a list (`["gpu", "fast"]`). Empty means any host. |
 
 ## TestCommand
 
@@ -71,17 +76,32 @@ This document describes the full YAML schema for `tm` test configuration files.
 If the `timeout` section is omitted entirely, both default values apply.
 If only one field is specified, the other uses its default.
 
+## Environment variable layering
+
+Environment variables are applied in this order (later wins):
+
+1. **`peer_environment`** (top-level) — global defaults for all peers
+2. **`environment`** (per-peer) — peer-specific overrides
+3. **System variables** — always set by `tm`, cannot be overridden:
+   - `REDIS_URL` — Redis connection URL
+   - `PEER_NAME` — peer's name
+   - `LISTEN_ADDR` — multiaddr for the peer's QUIC listener
+   - `HOST_NAME` — display name of the host running this peer
+
 ## Peer assignment algorithm
 
 Peers are assigned to hosts as follows:
 
 1. Sort peers alphabetically by name
-2. Assign round-robin across the `hosts` list
-3. Each host gets a separate port counter starting at its own `base_port`
-4. Each peer on a host gets the next available port
+2. Group peers by their sorted `runs_on` tags (empty = universal group)
+3. For each group, find hosts whose `tags` contain **all** required tags (empty `runs_on` matches all hosts)
+4. Error if no host matches a group's required tags
+5. Round-robin peers within each group across their matching hosts
+6. Port counters are shared across all groups (a host used by multiple groups accumulates ports correctly)
+7. Final assignments are sorted by peer name for deterministic output
 
 For example, with 5 peers (alice, bob, charlie, dave, eve), 2 hosts (host-0
-with `base_port: 11984`, host-1 with `base_port: 11984`):
+with `base_port: 11984`, host-1 with `base_port: 11984`), no tags:
 
 | Peer | Host | Port |
 |------|------|------|
@@ -90,6 +110,21 @@ with `base_port: 11984`, host-1 with `base_port: 11984`):
 | charlie | host-0 | 11985 |
 | dave | host-1 | 11985 |
 | eve | host-0 | 11986 |
+
+With tags — peers with `runs_on: [gpu]` are assigned only to hosts tagged `gpu`.
+
+## CLI flags
+
+| Flag | Description |
+|------|-------------|
+| `--tui` | Enable the ratatui TUI interface (default: console mode) |
+| `--verbose` | Print tracing log output to stderr (console mode only) |
+| `--redis-url <URL>` | Use an external Redis instance instead of starting one |
+| `--reset-hosts` | Connect to all hosts, remove Docker images listed in `images`, then exit |
+| `--reset-hosts-all` | Connect to all hosts, run `docker system prune -af`, then exit |
+| `--version` | Print version and exit |
+
+`--reset-hosts` and `--reset-hosts-all` are standalone operations — they do not start Redis, distribute images, or run peers.
 
 ## Full example
 
@@ -109,19 +144,35 @@ images:
   - "ghcr.io/cryptidtech/python-mule:latest"
   - "ghcr.io/cryptidtech/go-mule:latest"
 
+remove_images: false
+
+peer_environment:
+  LOG_LEVEL: info
+
 hosts:
-  - address: localhost
+  - address: gpu-host-1
+    name: "GPU Box 1"
     ssh_user: user
     ssh_auth: agent
     base_port: 11984
+    tags: [gpu, fast]
+  - address: cpu-host-1
+    ssh_user: user
+    ssh_auth: agent
+    base_port: 11984
+    tags: [cpu]
 
 peers:
   - name: alice
     image: "ghcr.io/cryptidtech/rust-mule:latest"
     bootstrap: [bob, charlie]
+    runs_on: gpu
+    environment:
+      RUST_LOG: debug
   - name: bob
     image: "ghcr.io/cryptidtech/python-mule:latest"
     bootstrap: [alice]
+    runs_on: [cpu]
   - name: charlie
     image: "ghcr.io/cryptidtech/go-mule:latest"
     bootstrap: [alice, bob]

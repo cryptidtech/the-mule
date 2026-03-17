@@ -15,7 +15,7 @@ fn parse_real_smoke_test_yaml() {
     assert_eq!(config.redis.port, 6399);
     assert_eq!(config.images.len(), 3);
 
-    let assignments = assign_peers(&config);
+    let assignments = assign_peers(&config).unwrap();
     assert_eq!(assignments.len(), 5);
     // Verify per-peer images are propagated
     for a in &assignments {
@@ -225,7 +225,7 @@ fn per_peer_docker_image_in_assignment() {
         commands: []
         "#,
     );
-    let assignments = assign_peers(&config);
+    let assignments = assign_peers(&config).unwrap();
     assert_eq!(assignments[0].peer_name, "alice");
     assert_eq!(assignments[0].docker_image, "rust-peer:latest");
     assert_eq!(assignments[1].peer_name, "bob");

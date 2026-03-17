@@ -29,6 +29,7 @@ use the_mule::peer_monitor::PeerState;
 
 #[derive(Parser)]
 #[command(name = "tm")]
+#[command(version)]
 #[command(about = "Orchestrate distributed peer integration tests")]
 struct Args {
     /// Path to test YAML config
@@ -42,6 +43,12 @@ struct Args {
     /// Use an external Redis instance instead of starting one (e.g. redis://host:6399)
     #[arg(long)]
     redis_url: Option<String>,
+    /// Remove Docker images from all hosts and exit (images listed in config)
+    #[arg(long)]
+    reset_hosts: bool,
+    /// Run `docker system prune -af` on all hosts and exit
+    #[arg(long)]
+    reset_hosts_all: bool,
 }
 
 #[tokio::main]
@@ -51,6 +58,38 @@ async fn main() -> Result<()> {
         File::open(&args.config).context("failed to open config file")?,
     )
     .context("failed to parse config YAML")?;
+
+    // Handle --reset-hosts / --reset-hosts-all (early exit, no Redis/log needed)
+    if args.reset_hosts || args.reset_hosts_all {
+        println!("connecting to hosts via SSH...");
+        let mut ssh_managers: HashMap<String, ssh_mgr::SshManager> = HashMap::new();
+        for host in &config.hosts {
+            ssh_managers
+                .entry(host.address.clone())
+                .or_insert_with(|| {
+                    ssh_mgr::SshManager::new(host).expect("failed to create SSH session")
+                });
+        }
+        println!("connected to {} host(s)", ssh_managers.len());
+
+        for host in &config.hosts {
+            if let Some(mgr) = ssh_managers.get(&host.address) {
+                if args.reset_hosts_all {
+                    println!("pruning Docker on {}...", host.display_name());
+                    docker_mgr::prune_host(mgr, &host.address, true);
+                } else {
+                    println!(
+                        "removing {} image(s) on {}...",
+                        config.images.len(),
+                        host.display_name()
+                    );
+                    docker_mgr::remove_images_on_host(mgr, &host.address, &config.images, true);
+                }
+            }
+        }
+        println!("done");
+        return Ok(());
+    }
 
     // Create log file
     let now = chrono::Local::now();
@@ -132,7 +171,7 @@ async fn main() -> Result<()> {
     redis_mgr::enable_keyspace_notifications(&mut redis_conn).await;
 
     // Compute peer-to-host assignments (round-robin, unique ports)
-    let assignments = assign_peers(&config);
+    let assignments = assign_peers(&config).map_err(|e| anyhow::anyhow!(e))?;
 
     // Build SSH connect info (lightweight, no connections yet)
     let ssh_connect_infos: HashMap<String, ssh_mgr::SshConnectInfo> = config
@@ -242,6 +281,7 @@ async fn main() -> Result<()> {
             &assignments,
             &ssh_managers,
             redis_mgr.as_ref(),
+            &config,
         )
         .await;
         anyhow::bail!("peer startup failed: {e}");
@@ -297,6 +337,7 @@ async fn main() -> Result<()> {
         &assignments,
         &ssh_managers,
         redis_mgr.as_ref(),
+        &config,
     )
     .await;
 
@@ -552,6 +593,7 @@ async fn cleanup(
     assignments: &[config::PeerAssignment],
     ssh_managers: &HashMap<String, ssh_mgr::SshManager>,
     redis_mgr: Option<&redis_mgr::RedisManager>,
+    config: &TestConfig,
 ) {
     // Cancel all monitor tasks
     cancel.cancel();
@@ -566,6 +608,15 @@ async fn cleanup(
             &assignment.host.address,
             ssh_managers,
         );
+    }
+
+    // Remove images if configured
+    if config.remove_images {
+        for host in &config.hosts {
+            if let Some(mgr) = ssh_managers.get(&host.address) {
+                docker_mgr::remove_images_on_host(mgr, &host.address, &config.images, true);
+            }
+        }
     }
 
     // Stop Redis (only if we started it)

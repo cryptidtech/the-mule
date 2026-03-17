@@ -27,16 +27,24 @@ images:
   - "ghcr.io/cryptidtech/python-mule:latest"
   - "ghcr.io/cryptidtech/go-mule:latest"
 
+remove_images: false
+
+peer_environment:
+  LOG_LEVEL: info
+
 hosts:
   - address: localhost
+    name: "Local Dev Box"
     ssh_user: user
     ssh_auth: agent
     base_port: 11984
+    tags: [dev]
 
 peers:
   - name: alice
     image: "ghcr.io/cryptidtech/rust-mule:latest"
     bootstrap: [bob, charlie]
+    runs_on: dev
     environment:
       RUST_LOG: info
   - name: bob
@@ -44,23 +52,15 @@ peers:
     bootstrap: [alice]
     environment:
       LOGLEVEL: INFO
-      LOG_LEVEL: INFO
   - name: charlie
     image: "ghcr.io/cryptidtech/go-mule:latest"
     bootstrap: [alice, bob]
-    environment:
-      LOG_LEVEL: info
   - name: dave
     image: "ghcr.io/cryptidtech/rust-mule:latest"
     bootstrap: [alice, charlie]
-    environment:
-      RUST_LOG: info
   - name: eve
     image: "ghcr.io/cryptidtech/python-mule:latest"
     bootstrap: [bob, dave]
-    environment:
-      LOGLEVEL: INFO
-      LOG_LEVEL: INFO
 
 commands:
   # t=0: everyone connects

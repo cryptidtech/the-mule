@@ -13,6 +13,9 @@ redis:
 images:
   - "ghcr.io/cryptidtech/python-mule:latest"
 
+peer_environment:
+  LOG_LEVEL: info
+
 hosts:
   - address: localhost
     ssh_user: user

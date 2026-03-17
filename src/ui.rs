@@ -351,9 +351,11 @@ mod tests {
             peer_name: "alice".to_string(),
             host: crate::config::HostConfig {
                 address: "host0".to_string(),
+                name: None,
                 ssh_user: "user".to_string(),
                 ssh_auth: "agent".to_string(),
                 base_port: 10000,
+                tags: Vec::new(),
             },
             port: 10000,
             listen_addr: "/ip4/0.0.0.0/udp/10000/quic-v1".to_string(),

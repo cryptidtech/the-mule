@@ -489,14 +489,16 @@ pub fn start_peer(
         }
     }
 
-    // Build env var args
-    let mut env_args = format!(
-        "-e REDIS_URL={redis_url} -e PEER_NAME={name} -e LISTEN_ADDR={listen}",
-        listen = assignment.listen_addr
-    );
+    // Build env var args: extra_env first (global + peer-specific), system vars last (last wins)
+    let mut env_args = String::new();
     for (k, v) in &assignment.extra_env {
-        env_args.push_str(&format!(" -e {k}={v}"));
+        env_args.push_str(&format!("-e {k}={v} "));
     }
+    let host_name = assignment.host.display_name();
+    env_args.push_str(&format!(
+        "-e REDIS_URL={redis_url} -e PEER_NAME={name} -e LISTEN_ADDR={listen} -e HOST_NAME={host_name}",
+        listen = assignment.listen_addr
+    ));
 
     let image = &assignment.docker_image;
     let cmd = format!(
@@ -548,6 +550,61 @@ pub fn stop_peer(
     }
     tracing::info!("stopped peer '{}' on {}", peer_name, host_address);
     Ok(())
+}
+
+/// Remove specific Docker images on a remote host.
+pub fn remove_images_on_host(
+    mgr: &SshManager,
+    host_address: &str,
+    images: &[String],
+    console_mode: bool,
+) {
+    for image in images {
+        let cmd = format!("docker rmi -f '{image}'");
+        match mgr.exec(&cmd) {
+            Ok(ExitStatus::Success(_)) => {
+                let msg = format!("  removed image '{image}' on {host_address}");
+                tracing::info!("{msg}");
+                console_print(console_mode, &msg);
+            }
+            Ok(ExitStatus::Failed(err)) => {
+                tracing::warn!("failed to remove image '{image}' on {host_address}: {err}");
+                console_print(
+                    console_mode,
+                    &format!("  warning: failed to remove '{image}' on {host_address}: {err}"),
+                );
+            }
+            Err(e) => {
+                tracing::warn!("failed to remove image '{image}' on {host_address}: {e}");
+            }
+        }
+    }
+}
+
+/// Run `docker system prune -af` on a remote host.
+pub fn prune_host(
+    mgr: &SshManager,
+    host_address: &str,
+    console_mode: bool,
+) {
+    let cmd = "docker system prune -af";
+    match mgr.exec(cmd) {
+        Ok(ExitStatus::Success(out)) => {
+            let msg = format!("  pruned Docker on {host_address}");
+            tracing::info!("{msg}: {}", out.trim());
+            console_print(console_mode, &msg);
+        }
+        Ok(ExitStatus::Failed(err)) => {
+            tracing::warn!("docker system prune failed on {host_address}: {err}");
+            console_print(
+                console_mode,
+                &format!("  warning: prune failed on {host_address}: {err}"),
+            );
+        }
+        Err(e) => {
+            tracing::warn!("docker system prune failed on {host_address}: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
