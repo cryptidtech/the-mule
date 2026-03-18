@@ -3,6 +3,44 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(transparent)]
+pub struct PeerName(String);
+
+impl PeerName {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PeerName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}]", self.0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(transparent)]
+pub struct HostName(String);
+
+impl HostName {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for HostName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{}>", self.0)
+    }
+}
+
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -66,14 +104,17 @@ impl HostConfig {
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.address)
     }
+    pub fn host_name(&self) -> HostName {
+        HostName::new(self.display_name())
+    }
 }
 
 #[derive(Deserialize, Clone)]
 pub struct PeerConfig {
-    pub name: String,
+    pub name: PeerName,
     pub image: String,
     #[serde(default)]
-    pub bootstrap: Vec<String>,
+    pub bootstrap: Vec<PeerName>,
     #[serde(default, deserialize_with = "deserialize_environment")]
     pub environment: HashMap<String, String>,
     #[serde(default, deserialize_with = "deserialize_string_or_list")]
@@ -171,7 +212,7 @@ where
 #[derive(Deserialize, Clone)]
 pub struct TestCommand {
     pub time: u64,
-    pub peer: String,
+    pub peer: PeerName,
     pub command: String,
 }
 
@@ -202,7 +243,7 @@ impl Default for TimeoutConfig {
 /// Computed at startup: maps each peer to a host + port.
 #[derive(Clone, Debug)]
 pub struct PeerAssignment {
-    pub peer_name: String,
+    pub peer_name: PeerName,
     pub host: HostConfig,
     pub port: u16,
     pub listen_addr: String,
@@ -217,7 +258,7 @@ pub struct PeerAssignment {
 /// Returns an error if any peer's tags cannot be satisfied by any host.
 pub fn assign_peers(config: &TestConfig) -> Result<Vec<PeerAssignment>, String> {
     let mut sorted_peers: Vec<&PeerConfig> = config.peers.iter().collect();
-    sorted_peers.sort_by(|a, b| a.name.cmp(&b.name));
+    sorted_peers.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
 
     // Group peers by their sorted runs_on tags
     let mut groups: BTreeMap<Vec<String>, Vec<&PeerConfig>> = BTreeMap::new();
@@ -386,10 +427,10 @@ mod tests {
         let assignments = assign_peers(&config).unwrap();
         assert_eq!(assignments.len(), 2);
         // Alphabetical: alice, bob — both go to host0
-        assert_eq!(assignments[0].peer_name, "alice");
+        assert_eq!(assignments[0].peer_name.as_str(), "alice");
         assert_eq!(assignments[0].port, 10000);
         assert_eq!(assignments[0].docker_image, "test:latest");
-        assert_eq!(assignments[1].peer_name, "bob");
+        assert_eq!(assignments[1].peer_name.as_str(), "bob");
         assert_eq!(assignments[1].port, 10001);
         assert_eq!(assignments[1].docker_image, "test:latest");
     }
@@ -424,14 +465,14 @@ mod tests {
         .unwrap();
         let assignments = assign_peers(&config).unwrap();
         // Alphabetical: alice(host0:10000), bob(host1:10000), charlie(host0:10001)
-        assert_eq!(assignments[0].peer_name, "alice");
+        assert_eq!(assignments[0].peer_name.as_str(), "alice");
         assert_eq!(assignments[0].host.address, "host0");
         assert_eq!(assignments[0].port, 10000);
         assert_eq!(assignments[0].docker_image, "test:latest");
-        assert_eq!(assignments[1].peer_name, "bob");
+        assert_eq!(assignments[1].peer_name.as_str(), "bob");
         assert_eq!(assignments[1].host.address, "host1");
         assert_eq!(assignments[1].port, 10000);
-        assert_eq!(assignments[2].peer_name, "charlie");
+        assert_eq!(assignments[2].peer_name.as_str(), "charlie");
         assert_eq!(assignments[2].host.address, "host0");
         assert_eq!(assignments[2].port, 10001);
     }
@@ -468,15 +509,15 @@ mod tests {
         .unwrap();
         let assignments = assign_peers(&config).unwrap();
         // alice->host0:10000, bob->host1:20000, charlie->host0:10001, dave->host1:20001
-        assert_eq!(assignments[0].peer_name, "alice");
+        assert_eq!(assignments[0].peer_name.as_str(), "alice");
         assert_eq!(assignments[0].port, 10000);
         assert_eq!(assignments[0].docker_image, "img-a:latest");
-        assert_eq!(assignments[1].peer_name, "bob");
+        assert_eq!(assignments[1].peer_name.as_str(), "bob");
         assert_eq!(assignments[1].port, 20000);
         assert_eq!(assignments[1].docker_image, "img-b:latest");
-        assert_eq!(assignments[2].peer_name, "charlie");
+        assert_eq!(assignments[2].peer_name.as_str(), "charlie");
         assert_eq!(assignments[2].port, 10001);
-        assert_eq!(assignments[3].peer_name, "dave");
+        assert_eq!(assignments[3].peer_name.as_str(), "dave");
         assert_eq!(assignments[3].port, 20001);
     }
 
@@ -634,9 +675,9 @@ mod tests {
         .unwrap();
         let assignments = assign_peers(&config).unwrap();
         // alice -> gpu-host, bob -> cpu-host, charlie -> any (round-robin across both)
-        let alice = assignments.iter().find(|a| a.peer_name == "alice").unwrap();
+        let alice = assignments.iter().find(|a| a.peer_name.as_str() == "alice").unwrap();
         assert_eq!(alice.host.address, "gpu-host");
-        let bob = assignments.iter().find(|a| a.peer_name == "bob").unwrap();
+        let bob = assignments.iter().find(|a| a.peer_name.as_str() == "bob").unwrap();
         assert_eq!(bob.host.address, "cpu-host");
     }
 

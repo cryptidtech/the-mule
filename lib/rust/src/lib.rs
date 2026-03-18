@@ -37,40 +37,26 @@ pub enum Command {
     Disconnect,
     Shutdown,
     Restart { delay_secs: u64 },
-    Push { peer: String, message: String },
-    Pull,
-    RotateKey,
-    Track { peer: String },
-    Peer { vlad: String, multiaddr: String },
-    Unknown(String),
+    Peer { multiaddr: String },
+    Test(String),
 }
 
 impl Command {
     /// Parse a raw pipe-delimited command string from Redis.
     pub fn parse(raw: &str) -> Self {
-        let parts: Vec<&str> = raw.splitn(3, '|').collect();
+        let parts: Vec<&str> = raw.splitn(2, '|').collect();
         match parts[0] {
             "connect" => Command::Connect,
             "disconnect" => Command::Disconnect,
             "shutdown" => Command::Shutdown,
             "restart" if parts.len() >= 2 => match parts[1].parse::<u64>() {
                 Ok(delay) => Command::Restart { delay_secs: delay },
-                Err(_) => Command::Unknown(raw.to_string()),
+                Err(_) => Command::Test(raw.to_string()),
             },
-            "push" if parts.len() == 3 => Command::Push {
-                peer: parts[1].to_string(),
-                message: parts[2].to_string(),
+            "peer" if parts.len() >= 2 => Command::Peer {
+                multiaddr: parts[1].to_string(),
             },
-            "pull" => Command::Pull,
-            "rotate-key" => Command::RotateKey,
-            "track" if parts.len() >= 2 => Command::Track {
-                peer: parts[1].to_string(),
-            },
-            "peer" if parts.len() == 3 => Command::Peer {
-                vlad: parts[1].to_string(),
-                multiaddr: parts[2].to_string(),
-            },
-            _ => Command::Unknown(raw.to_string()),
+            _ => Command::Test(raw.to_string()),
         }
     }
 }
@@ -288,66 +274,25 @@ mod tests {
     fn parse_restart_invalid_delay() {
         assert_eq!(
             Command::parse("restart|abc"),
-            Command::Unknown("restart|abc".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_push() {
-        assert_eq!(
-            Command::parse("push|bob|hello world"),
-            Command::Push {
-                peer: "bob".to_string(),
-                message: "hello world".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_pull() {
-        assert_eq!(Command::parse("pull"), Command::Pull);
-    }
-
-    #[test]
-    fn parse_rotate_key() {
-        assert_eq!(Command::parse("rotate-key"), Command::RotateKey);
-    }
-
-    #[test]
-    fn parse_track() {
-        assert_eq!(
-            Command::parse("track|alice"),
-            Command::Track {
-                peer: "alice".to_string(),
-            }
+            Command::Test("restart|abc".to_string())
         );
     }
 
     #[test]
     fn parse_peer() {
         assert_eq!(
-            Command::parse("peer|vlad123|/ip4/1.2.3.4/udp/10000/quic-v1"),
+            Command::parse("peer|/ip4/1.2.3.4/udp/10000/quic-v1"),
             Command::Peer {
-                vlad: "vlad123".to_string(),
                 multiaddr: "/ip4/1.2.3.4/udp/10000/quic-v1".to_string(),
             }
         );
     }
 
     #[test]
-    fn parse_unknown() {
+    fn parse_test() {
         assert_eq!(
             Command::parse("foobar"),
-            Command::Unknown("foobar".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_push_missing_message() {
-        // push with only one pipe-separated part should be unknown
-        assert_eq!(
-            Command::parse("push|bob"),
-            Command::Unknown("push|bob".to_string())
+            Command::Test("foobar".to_string())
         );
     }
 

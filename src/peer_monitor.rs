@@ -3,20 +3,22 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::PeerName;
+
 #[derive(Clone, Debug)]
 pub enum PeerEvent {
-    StatusChange { peer: String, status: String },
-    LogEntry { peer: String, level: String, message: String },
+    StatusChange { peer: PeerName, status: String },
+    LogEntry { peer: PeerName, level: String, message: String },
 }
 
 /// Shared state between monitor tasks and the UI/orchestrator.
 pub struct PeerState {
     /// peer_name -> current status string (e.g. "started", "connecting", "connected")
-    pub statuses: BTreeMap<String, String>,
-    /// peer_name -> (VLAD string, multiaddr string) — populated from "started|<VLAD>|<multiaddr>"
-    pub peer_info: BTreeMap<String, (String, String)>,
+    pub statuses: BTreeMap<PeerName, String>,
+    /// peer_name -> multiaddr string — populated from "started|<multiaddr>"
+    pub peer_info: BTreeMap<PeerName, String>,
     /// Aggregated log lines: (peer_name, level, message)
-    pub logs: Vec<(String, String, String)>,
+    pub logs: Vec<(PeerName, String, String)>,
 }
 
 impl PeerState {
@@ -42,7 +44,7 @@ async fn blpop(
 
 /// Process a raw status string, updating shared state and broadcasting events.
 async fn process_status(
-    peer_name: &str,
+    peer_name: &PeerName,
     raw_status: &str,
     last_status: &mut Option<String>,
     state: &Arc<Mutex<PeerState>>,
@@ -53,18 +55,22 @@ async fn process_status(
     }
     *last_status = Some(raw_status.to_string());
     let mut state = state.lock().await;
-    let parts: Vec<&str> = raw_status.splitn(3, '|').collect();
+    let parts: Vec<&str> = raw_status.splitn(2, '|').collect();
     let status = parts[0].to_string();
-    state.statuses.insert(peer_name.to_string(), status.clone());
-    if parts.len() == 3 && parts[0] == "started" {
-        state.peer_info.insert(
-            peer_name.to_string(),
-            (parts[1].to_string(), parts[2].to_string()),
-        );
+    state.statuses.insert(peer_name.clone(), status.clone());
+    if parts[0] == "started" {
+        if parts.len() == 2 {
+            state.peer_info.insert(peer_name.clone(), parts[1].to_string());
+        } else {
+            tracing::debug!(
+                peer = %peer_name,
+                "peer reported 'started' without multiaddr (raw: {raw_status})"
+            );
+        }
     }
     if let Some(ref tx) = event_tx {
         let _ = tx.send(PeerEvent::StatusChange {
-            peer: peer_name.to_string(),
+            peer: peer_name.clone(),
             status,
         });
     }
@@ -74,14 +80,14 @@ async fn process_status(
 /// Subscribes to keyspace notifications for `<name>_status` and drains `<name>_log` via BLPOP.
 /// If `event_tx` is `Some`, broadcasts `PeerEvent`s for console mode.
 pub async fn monitor_peer(
-    peer_name: String,
+    peer_name: PeerName,
     redis_client: redis::Client,
     state: Arc<Mutex<PeerState>>,
     cancel: CancellationToken,
     event_tx: Option<tokio::sync::broadcast::Sender<PeerEvent>>,
 ) {
-    let status_key = format!("{peer_name}_status");
-    let log_key = format!("{peer_name}_log");
+    let status_key = format!("{}_status", peer_name.as_str());
+    let log_key = format!("{}_log", peer_name.as_str());
     let channel = format!("__keyspace@0__:{status_key}");
 
     // Create dedicated connections:
@@ -163,12 +169,14 @@ pub async fn monitor_peer(
                         }
 
                         let canonical_level = parsed_level.as_str().to_ascii_lowercase();
-                        let mut state = state.lock().await;
-                        state.logs.push((
-                            peer_name.clone(),
-                            canonical_level.clone(),
-                            message.to_string(),
-                        ));
+                        {
+                            let mut state = state.lock().await;
+                            state.logs.push((
+                                peer_name.clone(),
+                                canonical_level.clone(),
+                                message.to_string(),
+                            ));
+                        }
 
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(PeerEvent::LogEntry {
@@ -199,28 +207,28 @@ mod tests {
     #[test]
     fn peer_state_insert_and_retrieve() {
         let mut state = PeerState::new();
+        let alice = PeerName::new("alice");
         state
             .statuses
-            .insert("alice".to_string(), "started".to_string());
-        assert_eq!(state.statuses.get("alice").unwrap(), "started");
+            .insert(alice.clone(), "started".to_string());
+        assert_eq!(state.statuses.get(&alice).unwrap(), "started");
         state.peer_info.insert(
-            "alice".to_string(),
-            ("vlad123".to_string(), "/ip4/1.2.3.4".to_string()),
+            alice.clone(),
+            "/ip4/1.2.3.4".to_string(),
         );
-        let (vlad, addr) = state.peer_info.get("alice").unwrap();
-        assert_eq!(vlad, "vlad123");
+        let addr = state.peer_info.get(&alice).unwrap();
         assert_eq!(addr, "/ip4/1.2.3.4");
     }
 
     #[test]
     fn peer_event_clone() {
         let event = PeerEvent::StatusChange {
-            peer: "bob".to_string(),
+            peer: PeerName::new("bob"),
             status: "connected".to_string(),
         };
         let cloned = event.clone();
         if let PeerEvent::StatusChange { peer, status } = cloned {
-            assert_eq!(peer, "bob");
+            assert_eq!(peer.as_str(), "bob");
             assert_eq!(status, "connected");
         } else {
             panic!("expected StatusChange");

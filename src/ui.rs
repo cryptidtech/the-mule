@@ -7,7 +7,7 @@ use ratatui::Frame;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::config::{PeerAssignment, TestCommand};
+use crate::config::{PeerAssignment, PeerName, TestCommand};
 
 /// Batch of commands sharing the same timestamp.
 pub struct CommandBatch {
@@ -19,7 +19,7 @@ pub struct CommandBatch {
 }
 
 pub struct BatchCommand {
-    pub peer: String,
+    pub peer: PeerName,
     pub host: String,
     pub command: String,
 }
@@ -29,7 +29,7 @@ pub fn build_batches(
     commands: &[TestCommand],
     assignments: &[PeerAssignment],
 ) -> Vec<CommandBatch> {
-    let host_map: BTreeMap<String, String> = assignments
+    let host_map: BTreeMap<PeerName, String> = assignments
         .iter()
         .map(|a| (a.peer_name.clone(), a.host.address.clone()))
         .collect();
@@ -78,7 +78,7 @@ pub fn render(
     frame: &mut Frame,
     name: &str,
     elapsed: Duration,
-    statuses: &BTreeMap<String, String>,
+    statuses: &BTreeMap<PeerName, String>,
     assignments: &[PeerAssignment],
     batches: &[CommandBatch],
     current_batch_idx: usize,
@@ -130,7 +130,7 @@ fn render_header(frame: &mut Frame, area: Rect, name: &str, elapsed: Duration) {
 fn render_peers(
     frame: &mut Frame,
     area: Rect,
-    statuses: &BTreeMap<String, String>,
+    statuses: &BTreeMap<PeerName, String>,
     assignments: &[PeerAssignment],
 ) {
     let block = Block::default()
@@ -156,7 +156,7 @@ fn render_peers(
 
             let entry = format!(
                 " {:<10} {:<16} {}",
-                assignment.peer_name, assignment.host.address, status
+                assignment.peer_name.as_str(), assignment.host.address, status
             );
 
             if i == 1 {
@@ -256,7 +256,7 @@ fn render_commands(
                 Span::styled(
                     format!(
                         " {marker} {sent_time}  {delta:<6} {peer:<10} {host:<16} {cmd:<20} {status}",
-                        peer = cmd.peer,
+                        peer = cmd.peer.as_str(),
                         host = cmd.host,
                         cmd = truncated_cmd,
                     ),
@@ -333,22 +333,22 @@ mod tests {
         let commands = vec![
             crate::config::TestCommand {
                 time: 0,
-                peer: "alice".to_string(),
+                peer: PeerName::new("alice"),
                 command: "connect".to_string(),
             },
             crate::config::TestCommand {
                 time: 0,
-                peer: "bob".to_string(),
+                peer: PeerName::new("bob"),
                 command: "connect".to_string(),
             },
             crate::config::TestCommand {
                 time: 10,
-                peer: "alice".to_string(),
+                peer: PeerName::new("alice"),
                 command: "push".to_string(),
             },
         ];
         let assignments = vec![PeerAssignment {
-            peer_name: "alice".to_string(),
+            peer_name: PeerName::new("alice"),
             host: crate::config::HostConfig {
                 address: "host0".to_string(),
                 name: None,

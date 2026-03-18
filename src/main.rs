@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use the_mule::config::{assign_peers, TestConfig};
+use the_mule::config::{assign_peers, PeerName, TestConfig};
 use the_mule::peer_monitor::PeerState;
 
 #[derive(Parser)]
@@ -117,12 +117,12 @@ async fn main() -> Result<()> {
     // Configure tracing — file layer always present, console layer in console mode
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(log_file)
-        .with_ansi(false);
+        .event_format(console::PeerAwareFormatter::new(false));
 
     if let Some(ref m) = multi {
         let console_layer = tracing_subscriber::fmt::layer()
             .with_writer(console::IndicatifMakeWriter::new(m.clone()))
-            .with_ansi(true);
+            .event_format(console::PeerAwareFormatter::new(true));
         tracing_subscriber::registry()
             .with(file_layer)
             .with(console_layer)
@@ -221,8 +221,8 @@ async fn main() -> Result<()> {
     // Phase 3: Clear stale Redis queues and start peer containers
     let clear_spinner = multi.as_ref().map(|m| console::new_spinner(m, "clearing stale Redis queues..."));
     for assignment in &assignments {
-        let command_key = format!("{}_command", assignment.peer_name);
-        let log_key = format!("{}_log", assignment.peer_name);
+        let command_key = format!("{}_command", assignment.peer_name.as_str());
+        let log_key = format!("{}_log", assignment.peer_name.as_str());
         redis::AsyncCommands::del::<_, ()>(&mut redis_conn, &command_key)
             .await
             .context(format!("failed to DEL {command_key}"))?;
@@ -241,7 +241,7 @@ async fn main() -> Result<()> {
             multi.as_ref().map(|m| {
                 console::new_spinner(
                     m,
-                    &format!("{}: starting {}", a.host.display_name(), a.peer_name),
+                    &format!("{}: starting {}", a.host.display_name(), a.peer_name.as_str()),
                 )
             })
         })
@@ -251,14 +251,14 @@ async fn main() -> Result<()> {
         let docker_cmd = docker_mgr::start_peer(assignment, &redis_url, &ssh_managers)
             .context(format!(
                 "failed to start peer {} on {}",
-                assignment.peer_name, assignment.host.address
+                assignment.peer_name.as_str(), assignment.host.address
             ))?;
         tracing::info!("docker run command: {docker_cmd}");
         if let Some(ref s) = peer_spinners[i] {
             s.finish_with_message(format!(
                 "{}: started {}",
                 assignment.host.display_name(),
-                assignment.peer_name
+                assignment.peer_name.as_str()
             ));
         }
     }
@@ -282,7 +282,7 @@ async fn main() -> Result<()> {
     };
 
     // Spawn per-peer monitor tasks
-    let peer_names: Vec<String> = config.peers.iter().map(|p| p.name.clone()).collect();
+    let peer_names: Vec<PeerName> = config.peers.iter().map(|p| p.name.clone()).collect();
     let mut monitor_handles = Vec::new();
     for name in &peer_names {
         let handle = tokio::spawn(peer_monitor::monitor_peer(
@@ -392,19 +392,19 @@ async fn send_due_batches(
         if test_start.elapsed() >= target_time {
             let batch = &batches[*current_batch_idx];
             for cmd in &batch.commands {
-                let key = format!("{}_command", cmd.peer);
+                let key = format!("{}_command", cmd.peer.as_str());
                 if let Err(e) =
                     redis::AsyncCommands::lpush::<_, _, ()>(redis_conn, &key, &cmd.command).await
                 {
-                    tracing::warn!("failed to send command to {}: {e}", cmd.peer);
+                    tracing::warn!("failed to send command to {}: {e}", cmd.peer.as_str());
                 } else {
-                    let msg = format!(
-                        "[{:.1}s] sent to {}: {}",
+                    tracing::info!(
+                        peer_name = cmd.peer.as_str(),
+                        direction = ">",
+                        "[{:.1}s] {}",
                         test_start.elapsed().as_secs_f64(),
-                        cmd.peer,
                         cmd.command
                     );
-                    tracing::info!("{msg}");
                 }
             }
             batches[*current_batch_idx].sent = true;
@@ -424,7 +424,7 @@ async fn run_tui(
     state: &Arc<Mutex<PeerState>>,
     test_start: Instant,
     shutdown_token: &CancellationToken,
-    peer_names: &[String],
+    peer_names: &[PeerName],
 ) -> Result<()> {
     // Set up terminal for TUI
     enable_raw_mode().context("failed to enable raw mode")?;
@@ -534,7 +534,7 @@ async fn run_console(
     state: &Arc<Mutex<PeerState>>,
     test_start: Instant,
     shutdown_token: &CancellationToken,
-    peer_names: &[String],
+    peer_names: &[PeerName],
     event_tx: &tokio::sync::broadcast::Sender<PeerEvent>,
 ) -> Result<()> {
     let mut current_batch_idx: usize = 0;
@@ -549,11 +549,11 @@ async fn run_console(
             event = event_rx.recv() => {
                 match event {
                     Ok(PeerEvent::StatusChange { peer, status }) => {
-                        tracing::info!("{peer}: {status}");
+                        tracing::info!(peer_name = peer.as_str(), direction = "<", "{status}");
                     }
                     Ok(PeerEvent::LogEntry { peer, level, message }) => {
                         if level == "error" || level == "warn" {
-                            tracing::warn!("[{level}] {peer}: {message}");
+                            tracing::warn!(peer_name = peer.as_str(), direction = ":", "[{level}] {message}");
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -634,7 +634,7 @@ async fn cleanup(
     // Stop all peer containers via SSH
     for assignment in assignments {
         let _ = docker_mgr::stop_peer(
-            &assignment.peer_name,
+            assignment.peer_name.as_str(),
             &assignment.host.address,
             ssh_managers,
         );

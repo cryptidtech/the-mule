@@ -226,8 +226,8 @@ fn per_peer_docker_image_in_assignment() {
         "#,
     );
     let assignments = assign_peers(&config).unwrap();
-    assert_eq!(assignments[0].peer_name, "alice");
+    assert_eq!(assignments[0].peer_name.as_str(), "alice");
     assert_eq!(assignments[0].docker_image, "rust-peer:latest");
-    assert_eq!(assignments[1].peer_name, "bob");
+    assert_eq!(assignments[1].peer_name.as_str(), "bob");
     assert_eq!(assignments[1].docker_image, "python-peer:latest");
 }

@@ -528,7 +528,7 @@ pub fn start_peer(
         .get(&assignment.host.address)
         .context(format!("no SSH session for {}", assignment.host.address))?;
 
-    let name = &assignment.peer_name;
+    let name = assignment.peer_name.as_str();
     let port = assignment.port;
     let container_name = format!("tm-{name}");
 

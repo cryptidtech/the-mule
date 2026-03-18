@@ -59,4 +59,4 @@ async fn main() {
 - `.build().await` — connect, install tracing, start background tasks
 - `MuleClient::send_status(status)` — push status to orchestrator
 - `impl Stream<Item = Command>` — yields parsed commands
-- `Command` enum: `Connect`, `Disconnect`, `Shutdown`, `Restart`, `Push`, `Pull`, `RotateKey`, `Track`, `Peer`, `Unknown`
+- `Command` enum: `Connect`, `Disconnect`, `Shutdown`, `Restart`, `Peer`, `Test`

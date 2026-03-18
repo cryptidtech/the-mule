@@ -40,15 +40,13 @@ Commands are pipe-delimited strings pushed to `{peer}_command`:
 
 | Command | Format | Description |
 |---------|--------|-------------|
-| connect | `connect` | Join the DHT network |
-| disconnect | `disconnect` | Leave the DHT network |
+| connect | `connect` | Join the network |
+| disconnect | `disconnect` | Leave the network |
 | shutdown | `shutdown` | Shut down the peer process |
 | restart | `restart\|<delay_secs>` | Restart with a delay |
-| push | `push\|<peer>\|<message>` | Push a message to another peer |
-| pull | `pull` | Pull pending messages |
-| rotate-key | `rotate-key` | Rotate the peer's signing key |
-| track | `track\|<peer>` | Start tracking another peer's VLAD |
-| peer | `peer\|<vlad>\|<multiaddr>` | Add a bootstrap peer |
+| peer | `peer\|<multiaddr>` | Add a bootstrap peer |
+
+Any other command string is forwarded as-is for the test application to parse.
 
 Peers receive commands by calling `BLPOP {peer}_command 0` (blocking until a
 command is available).
@@ -56,7 +54,7 @@ command is available).
 ### Status Format
 
 Status strings set on `{peer}_status` via Redis SET:
-- `started` or `started|<vlad>|<multiaddr>` — peer is ready
+- `started` or `started|<multiaddr>` — peer is ready
 - `connecting`, `connected`, `disconnecting`, `disconnected` — network states
 - `restarting` — about to restart
 - `stopped` — peer has shut down
