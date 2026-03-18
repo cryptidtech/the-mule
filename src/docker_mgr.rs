@@ -1,17 +1,13 @@
 use anyhow::{Context, Result};
+use indicatif::{MultiProgress, ProgressBar};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::config::PeerAssignment;
+use crate::console;
 use crate::ssh_mgr::{ExitStatus, SshConnectInfo, SshManager};
-
-/// Print a message to stdout when in console mode.
-fn console_print(console_mode: bool, msg: &str) {
-    if console_mode {
-        println!("{msg}");
-    }
-}
 
 /// Sanitize a Docker image name into a safe filename component.
 pub fn sanitize_image_name(image: &str) -> String {
@@ -61,6 +57,23 @@ fn check_local_image(image: &str) -> Result<String> {
     Ok(image_id)
 }
 
+/// Get the uncompressed size of a Docker image in bytes.
+fn get_image_size(image: &str) -> Result<u64> {
+    let output = Command::new("docker")
+        .args(["image", "inspect", "--format", "{{.Size}}", image])
+        .output()
+        .context("failed to run 'docker image inspect' for size")?;
+
+    if !output.status.success() {
+        anyhow::bail!("failed to get size of Docker image '{}'", image);
+    }
+
+    let size_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    size_str
+        .parse::<u64>()
+        .context(format!("failed to parse image size: {size_str}"))
+}
+
 /// Per-image distribution plan: which hosts are missing this image.
 struct ImagePlan {
     image: String,
@@ -103,26 +116,55 @@ fn check_remote_image_blocking(
 }
 
 /// Export a Docker image to a gzipped tar archive (blocking).
-fn export_image_blocking(image: &str, archive_path: &Path) -> Result<()> {
+/// If a `ProgressBar` is provided, polls output file size to show progress.
+fn export_image_blocking(image: &str, archive_path: &Path, pb: Option<ProgressBar>) -> Result<()> {
     tracing::info!("exporting Docker image '{}' to {}", image, archive_path.display());
+
+    if let Some(ref pb) = pb {
+        if let Ok(size) = get_image_size(image) {
+            pb.set_length(size);
+        }
+    }
 
     let cmd = format!(
         "docker save '{}' | gzip > '{}'",
         image,
         archive_path.display()
     );
-    let output = Command::new("sh")
+    let mut child = Command::new("sh")
         .args(["-c", &cmd])
-        .output()
-        .context("failed to run docker save")?;
+        .spawn()
+        .context("failed to spawn docker save")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("docker save failed for '{}': {}", image, stderr.trim());
+    // Poll output file size while child is running
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                if !status.success() {
+                    if let Some(ref pb) = pb {
+                        pb.abandon_with_message(format!("export failed: {image}"));
+                    }
+                    anyhow::bail!("docker save failed for '{}'", image);
+                }
+                break;
+            }
+            None => {
+                if let Some(ref pb) = pb {
+                    if let Ok(meta) = std::fs::metadata(archive_path) {
+                        pb.set_position(meta.len());
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
     }
 
     let size_mb = std::fs::metadata(archive_path)?.len() as f64 / (1024.0 * 1024.0);
     tracing::info!("image '{}' archive size: {:.1} MB", image, size_mb);
+
+    if let Some(ref pb) = pb {
+        pb.finish_and_clear();
+    }
 
     Ok(())
 }
@@ -132,13 +174,14 @@ fn transfer_blocking(
     connect_info: &SshConnectInfo,
     local_archive: &Path,
     remote_archive: &Path,
+    pb: Option<&ProgressBar>,
 ) -> Result<()> {
     let host_addr = &connect_info.host.address;
     tracing::info!("transferring image to {host_addr}...");
 
     let mgr = connect_info.connect()
         .context(format!("failed to connect to {host_addr} for transfer"))?;
-    mgr.scp_send_file(local_archive, remote_archive)
+    mgr.scp_send_file(local_archive, remote_archive, pb)
         .context(format!("failed to SCP image to {host_addr}"))?;
 
     Ok(())
@@ -148,9 +191,21 @@ fn transfer_blocking(
 fn import_and_cleanup_blocking(
     connect_info: &SshConnectInfo,
     remote_archive: &Path,
+    pb: Option<ProgressBar>,
 ) -> Result<()> {
     let host_addr = &connect_info.host.address;
+    let host_display = connect_info.host.display_name().to_string();
     tracing::info!("loading image on {host_addr}...");
+
+    if let Some(ref pb) = pb {
+        pb.set_style(
+            indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
+        );
+        pb.set_message(format!("{host_display}: adding docker image..."));
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    }
 
     let mgr = connect_info.connect()
         .context(format!("failed to connect to {host_addr} for import"))?;
@@ -159,6 +214,9 @@ fn import_and_cleanup_blocking(
     match mgr.exec(&load_cmd)? {
         ExitStatus::Success(_) => {}
         ExitStatus::Failed(err) => {
+            if let Some(ref pb) = pb {
+                pb.abandon_with_message(format!("{host_display}: import failed"));
+            }
             anyhow::bail!("failed to load image on {host_addr}: {err}");
         }
     }
@@ -172,6 +230,9 @@ fn import_and_cleanup_blocking(
     }
 
     tracing::info!("image loaded on {host_addr}");
+    if let Some(ref pb) = pb {
+        pb.finish_with_message(format!("{host_display}: configured"));
+    }
     Ok(())
 }
 
@@ -287,6 +348,7 @@ async fn plan_distribution(
 async fn distribute_images(
     plans: Vec<ImagePlan>,
     ssh_connect_infos: &HashMap<String, SshConnectInfo>,
+    multi: Option<&Arc<MultiProgress>>,
 ) -> Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
 
@@ -297,9 +359,10 @@ async fn distribute_images(
         // Spawn export task
         let image = plan.image.clone();
         let archive_path = plan.archive_path.clone();
+        let export_pb = multi.map(|m| console::new_progress_bar(m, 0, &format!("exporting {image}")));
         join_set.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                export_image_blocking(&image, &archive_path)
+                export_image_blocking(&image, &archive_path, export_pb)
             }).await?;
             if result.is_ok() {
                 let _ = export_tx.send(true);
@@ -318,6 +381,10 @@ async fn distribute_images(
                 sanitize_image_name(&image_name)
             ));
             let host = host_addr.clone();
+            let host_display = info.host.display_name().to_string();
+            let transfer_pb = multi.map(|m| {
+                console::new_progress_bar(m, 0, &format!("{host_display}: transferring {image_name}"))
+            });
 
             join_set.spawn(async move {
                 // Wait for export to complete
@@ -329,14 +396,16 @@ async fn distribute_images(
                 let info_clone = info.clone();
                 let la = local_archive.clone();
                 let ra = remote_archive.clone();
+                let pb_ref = transfer_pb.clone();
                 tokio::task::spawn_blocking(move || {
-                    transfer_blocking(&info_clone, &la, &ra)
+                    transfer_blocking(&info_clone, &la, &ra, pb_ref.as_ref())
                 }).await??;
 
-                // Import and cleanup
+                // Import and cleanup — reuse the bar as a spinner
                 let ra = remote_archive;
+                let import_pb = transfer_pb;
                 tokio::task::spawn_blocking(move || {
-                    import_and_cleanup_blocking(&info, &ra)
+                    import_and_cleanup_blocking(&info, &ra, import_pb)
                 }).await??;
 
                 tracing::info!("image '{}' distributed to {}", image_name, host);
@@ -378,7 +447,7 @@ async fn distribute_images(
 pub async fn distribute_all_images(
     assignments: &[PeerAssignment],
     ssh_connect_infos: &HashMap<String, SshConnectInfo>,
-    console_mode: bool,
+    multi: Option<&Arc<MultiProgress>>,
 ) -> Result<()> {
     // Derive unique (image, set_of_hosts) from assignments
     let mut image_hosts: HashMap<String, HashSet<String>> = HashMap::new();
@@ -393,7 +462,7 @@ pub async fn distribute_all_images(
         return Ok(());
     }
 
-    console_print(console_mode, "checking Docker images...");
+    tracing::info!("checking Docker images...");
 
     // Phase 1: plan distribution (parallel checks)
     let plans = plan_distribution(&image_hosts, ssh_connect_infos).await?;
@@ -403,7 +472,6 @@ pub async fn distribute_all_images(
 
     if plans.is_empty() {
         tracing::info!("all Docker images present on all remote hosts");
-        console_print(console_mode, "all Docker images present on all remote hosts");
         return Ok(());
     }
 
@@ -413,28 +481,19 @@ pub async fn distribute_all_images(
         plans.len(),
         total_missing
     );
-    console_print(
-        console_mode,
-        &format!(
-            "distributing {} image(s) to {} host target(s)...",
-            plans.len(),
-            total_missing
-        ),
-    );
 
     // Phase 2: export → transfer → import pipeline
-    distribute_images(plans, ssh_connect_infos).await?;
+    distribute_images(plans, ssh_connect_infos, multi).await?;
 
     tracing::info!("Docker image distribution complete");
-    console_print(console_mode, "Docker image distribution complete");
 
     Ok(())
 }
 
 /// Pull a list of Docker images locally. Bails on the first failure.
-pub fn pull_images(images: &[String], console_mode: bool) -> Result<()> {
+pub fn pull_images(images: &[String], multi: Option<&Arc<MultiProgress>>) -> Result<()> {
     for image in images {
-        console_print(console_mode, &format!("pulling Docker image '{image}'..."));
+        let spinner = multi.map(|m| console::new_spinner(m, &format!("pulling {image}...")));
         tracing::info!("pulling Docker image: {image}");
 
         let output = Command::new("docker")
@@ -444,10 +503,15 @@ pub fn pull_images(images: &[String], console_mode: bool) -> Result<()> {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if let Some(ref s) = spinner {
+                s.abandon_with_message(format!("pull failed: {image}"));
+            }
             anyhow::bail!("docker pull '{image}' failed: {}", stderr.trim());
         }
 
-        console_print(console_mode, &format!("  pulled '{image}'"));
+        if let Some(ref s) = spinner {
+            s.finish_with_message(format!("pulled {image}"));
+        }
         tracing::info!("pulled Docker image: {image}");
     }
     Ok(())
@@ -557,7 +621,7 @@ pub fn remove_images_on_host(
     mgr: &SshManager,
     host_address: &str,
     images: &[String],
-    console_mode: bool,
+    print: bool,
 ) {
     for image in images {
         let cmd = format!("docker rmi -f '{image}'");
@@ -565,14 +629,13 @@ pub fn remove_images_on_host(
             Ok(ExitStatus::Success(_)) => {
                 let msg = format!("  removed image '{image}' on {host_address}");
                 tracing::info!("{msg}");
-                console_print(console_mode, &msg);
+                if print { println!("{msg}"); }
             }
             Ok(ExitStatus::Failed(err)) => {
                 tracing::warn!("failed to remove image '{image}' on {host_address}: {err}");
-                console_print(
-                    console_mode,
-                    &format!("  warning: failed to remove '{image}' on {host_address}: {err}"),
-                );
+                if print {
+                    println!("  warning: failed to remove '{image}' on {host_address}: {err}");
+                }
             }
             Err(e) => {
                 tracing::warn!("failed to remove image '{image}' on {host_address}: {e}");
@@ -585,21 +648,20 @@ pub fn remove_images_on_host(
 pub fn prune_host(
     mgr: &SshManager,
     host_address: &str,
-    console_mode: bool,
+    print: bool,
 ) {
     let cmd = "docker system prune -af";
     match mgr.exec(cmd) {
         Ok(ExitStatus::Success(out)) => {
             let msg = format!("  pruned Docker on {host_address}");
             tracing::info!("{msg}: {}", out.trim());
-            console_print(console_mode, &msg);
+            if print { println!("{msg}"); }
         }
         Ok(ExitStatus::Failed(err)) => {
             tracing::warn!("docker system prune failed on {host_address}: {err}");
-            console_print(
-                console_mode,
-                &format!("  warning: prune failed on {host_address}: {err}"),
-            );
+            if print {
+                println!("  warning: prune failed on {host_address}: {err}");
+            }
         }
         Err(e) => {
             tracing::warn!("docker system prune failed on {host_address}: {e}");

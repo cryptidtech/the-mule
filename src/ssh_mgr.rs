@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use indicatif::ProgressBar;
 use ssh2::Session;
 use std::io::{Read, Write, BufReader};
 use std::net::TcpStream;
@@ -142,10 +143,21 @@ impl SshManager {
     }
 
     /// Send a local file to a remote host via SCP, streaming in 256KB chunks.
-    pub fn scp_send_file(&self, local_path: &Path, remote_path: &Path) -> Result<()> {
+    /// If a `ProgressBar` is provided, it is updated with bytes sent.
+    pub fn scp_send_file(
+        &self,
+        local_path: &Path,
+        remote_path: &Path,
+        pb: Option<&ProgressBar>,
+    ) -> Result<()> {
         let local_file = std::fs::File::open(local_path)
             .context(format!("failed to open {}", local_path.display()))?;
         let file_size = local_file.metadata()?.len();
+
+        if let Some(pb) = pb {
+            pb.set_length(file_size);
+            pb.set_position(0);
+        }
 
         let mut channel = self
             .session
@@ -154,12 +166,17 @@ impl SshManager {
 
         let mut reader = BufReader::with_capacity(256 * 1024, local_file);
         let mut buf = vec![0u8; 256 * 1024];
+        let mut bytes_sent: u64 = 0;
         loop {
             let n = reader.read(&mut buf)?;
             if n == 0 {
                 break;
             }
             channel.write_all(&buf[..n])?;
+            bytes_sent += n as u64;
+            if let Some(pb) = pb {
+                pb.set_position(bytes_sent);
+            }
         }
 
         channel.send_eof()?;

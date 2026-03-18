@@ -1,4 +1,5 @@
 use the_mule::config;
+use the_mule::console;
 use the_mule::docker_mgr;
 use the_mule::orchestrator;
 use the_mule::peer_monitor;
@@ -13,6 +14,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use indicatif::MultiProgress;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -37,9 +39,6 @@ struct Args {
     /// Enable the ratatui TUI interface (default: console mode)
     #[arg(long)]
     tui: bool,
-    /// Print tracing log output to stderr (only in console mode, filtered by RUST_LOG)
-    #[arg(long)]
-    verbose: bool,
     /// Use an external Redis instance instead of starting one (e.g. redis://host:6399)
     #[arg(long)]
     redis_url: Option<String>,
@@ -91,6 +90,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Create MultiProgress for console mode
+    let multi: Option<Arc<MultiProgress>> = if !args.tui {
+        Some(Arc::new(MultiProgress::new()))
+    } else {
+        None
+    };
+
     // Create log file
     let now = chrono::Local::now();
     let log_filename = format!(
@@ -100,15 +106,22 @@ async fn main() -> Result<()> {
     );
     let log_file = File::create(&log_filename).context("failed to create log file")?;
 
-    // Configure tracing — file layer always present, optional stderr layer in console+verbose mode
+    // Build log level filter from config (default: info)
+    let filter_str = config
+        .log_level
+        .as_ref()
+        .map(|l| l.as_filter_str())
+        .unwrap_or("info");
+    let env_filter = tracing_subscriber::EnvFilter::new(filter_str);
+
+    // Configure tracing — file layer always present, console layer in console mode
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(log_file)
         .with_ansi(false);
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env();
 
-    if !args.tui && args.verbose {
+    if let Some(ref m) = multi {
         let console_layer = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
+            .with_writer(console::IndicatifMakeWriter::new(m.clone()))
             .with_ansi(true);
         tracing_subscriber::registry()
             .with(file_layer)
@@ -144,19 +157,21 @@ async fn main() -> Result<()> {
 
     // Start Redis (or connect to external instance)
     let (redis_mgr, redis_client, redis_url) = if let Some(ref url) = args.redis_url {
-        console_print(!args.tui, &format!("using external Redis: {url}"));
+        tracing::info!("using external Redis: {url}");
         let client = redis::Client::open(url.as_str())
             .context("failed to create Redis client from --redis-url")?;
         (None, client, url.clone())
     } else {
-        console_print(!args.tui, "starting Redis...");
+        let spinner = multi.as_ref().map(|m| console::new_spinner(m, "starting Redis..."));
         let mgr =
             redis_mgr::RedisManager::start(&config.redis).context("failed to start Redis")?;
         let client = mgr
             .client(config.redis.port)
             .context("failed to create Redis client")?;
         let url = format!("redis://{}:{}", local_ip(), config.redis.port);
-        console_print(!args.tui, "Redis started");
+        if let Some(ref s) = spinner {
+            s.finish_with_message("Redis started");
+        }
         // Wait a moment for Redis to be ready
         tokio::time::sleep(Duration::from_secs(2)).await;
         (Some(mgr), client, url)
@@ -181,7 +196,7 @@ async fn main() -> Result<()> {
         .collect();
 
     // Create SSH managers for later peer start/stop (still synchronous)
-    console_print(!args.tui, "connecting to hosts via SSH...");
+    let ssh_spinner = multi.as_ref().map(|m| console::new_spinner(m, "connecting to hosts via SSH..."));
     let mut ssh_managers: HashMap<String, ssh_mgr::SshManager> = HashMap::new();
     for assignment in &assignments {
         ssh_managers
@@ -191,21 +206,20 @@ async fn main() -> Result<()> {
                     .expect("failed to create SSH session")
             });
     }
-    console_print(
-        !args.tui,
-        &format!("connected to {} host(s)", ssh_managers.len()),
-    );
+    if let Some(ref s) = ssh_spinner {
+        s.finish_with_message(format!("connected to {} host(s)", ssh_managers.len()));
+    }
 
     // Pre-pull images listed in the config
     if !config.images.is_empty() {
-        docker_mgr::pull_images(&config.images, !args.tui)?;
+        docker_mgr::pull_images(&config.images, multi.as_ref())?;
     }
 
     // Distribute Docker images to hosts (async, maximally parallel)
-    docker_mgr::distribute_all_images(&assignments, &ssh_connect_infos, !args.tui).await?;
+    docker_mgr::distribute_all_images(&assignments, &ssh_connect_infos, multi.as_ref()).await?;
 
     // Phase 3: Clear stale Redis queues and start peer containers
-    console_print(!args.tui, "clearing stale Redis queues...");
+    let clear_spinner = multi.as_ref().map(|m| console::new_spinner(m, "clearing stale Redis queues..."));
     for assignment in &assignments {
         let command_key = format!("{}_command", assignment.peer_name);
         let log_key = format!("{}_log", assignment.peer_name);
@@ -216,26 +230,45 @@ async fn main() -> Result<()> {
             .await
             .context(format!("failed to DEL {log_key}"))?;
     }
+    if let Some(ref s) = clear_spinner {
+        s.finish_with_message("cleared stale Redis queues");
+    }
 
-    console_print(!args.tui, "starting peer containers...");
-    for assignment in &assignments {
+    // Start peer containers with per-peer spinners
+    let peer_spinners: Vec<_> = assignments
+        .iter()
+        .map(|a| {
+            multi.as_ref().map(|m| {
+                console::new_spinner(
+                    m,
+                    &format!("{}: starting {}", a.host.display_name(), a.peer_name),
+                )
+            })
+        })
+        .collect();
+
+    for (i, assignment) in assignments.iter().enumerate() {
         let docker_cmd = docker_mgr::start_peer(assignment, &redis_url, &ssh_managers)
             .context(format!(
                 "failed to start peer {} on {}",
                 assignment.peer_name, assignment.host.address
             ))?;
-        console_print(
-            !args.tui,
-            &format!(
-                "  started container: {} on {}\n    {}",
-                assignment.peer_name, assignment.host.address, docker_cmd
-            ),
-        );
+        tracing::info!("docker run command: {docker_cmd}");
+        if let Some(ref s) = peer_spinners[i] {
+            s.finish_with_message(format!(
+                "{}: started {}",
+                assignment.host.display_name(),
+                assignment.peer_name
+            ));
+        }
     }
 
     // Give containers a moment to initialize before spawning BLPOP monitors
-    console_print(!args.tui, "waiting for containers to initialize...");
+    let init_spinner = multi.as_ref().map(|m| console::new_spinner(m, "waiting for containers to initialize..."));
     tokio::time::sleep(Duration::from_secs(2)).await;
+    if let Some(ref s) = init_spinner {
+        s.finish_with_message("containers initialized");
+    }
 
     // Shared state for peer statuses and identity info
     let state = Arc::new(Mutex::new(PeerState::new()));
@@ -263,7 +296,7 @@ async fn main() -> Result<()> {
     }
 
     // Wait for all peers to report "started" (configurable timeout)
-    console_print(!args.tui, "waiting for all peers to start...");
+    let start_spinner = multi.as_ref().map(|m| console::new_spinner(m, "waiting for all peers to start..."));
     tracing::info!("waiting for all peers to start...");
     if let Err(e) = orchestrator::wait_for_peers_started(
         &state,
@@ -273,7 +306,9 @@ async fn main() -> Result<()> {
     .await
     {
         tracing::error!("peer startup failed: {e}");
-        console_print(!args.tui, &format!("ERROR: peer startup failed: {e}"));
+        if let Some(ref s) = start_spinner {
+            s.abandon_with_message(format!("ERROR: peer startup failed: {e}"));
+        }
         orchestrator::shutdown_all_peers(&peer_names, &mut redis_conn).await;
         cleanup(
             cancel,
@@ -287,13 +322,15 @@ async fn main() -> Result<()> {
         anyhow::bail!("peer startup failed: {e}");
     }
     tracing::info!("all peers started successfully");
-    console_print(!args.tui, "all peers started");
+    if let Some(ref s) = start_spinner {
+        s.finish_with_message("all peers started");
+    }
 
     // Send bootstrap peer commands
     orchestrator::send_bootstrap_commands(&config, &state, &mut redis_conn)
         .await
         .context("failed to send bootstrap commands")?;
-    console_print(!args.tui, "bootstrap commands sent");
+    tracing::info!("bootstrap commands sent");
 
     // Build command batches
     let mut batches = ui::build_batches(&config.commands, &assignments);
@@ -301,7 +338,6 @@ async fn main() -> Result<()> {
     // Record test start time
     let test_start = Instant::now();
     tracing::info!("test timeline starting");
-    console_print(!args.tui, "test timeline starting");
 
     // Run TUI or console mode
     let result = if args.tui {
@@ -350,7 +386,6 @@ async fn send_due_batches(
     current_batch_idx: &mut usize,
     redis_conn: &mut redis::aio::MultiplexedConnection,
     test_start: Instant,
-    console_mode: bool,
 ) {
     while *current_batch_idx < batches.len() {
         let target_time = Duration::from_secs(batches[*current_batch_idx].time);
@@ -370,7 +405,6 @@ async fn send_due_batches(
                         cmd.command
                     );
                     tracing::info!("{msg}");
-                    console_print(console_mode, &msg);
                 }
             }
             batches[*current_batch_idx].sent = true;
@@ -405,7 +439,7 @@ async fn run_tui(
 
     let result = loop {
         // Send any due command batches
-        send_due_batches(batches, &mut current_batch_idx, redis_conn, test_start, false).await;
+        send_due_batches(batches, &mut current_batch_idx, redis_conn, test_start).await;
 
         // Render TUI
         let statuses = {
@@ -515,11 +549,11 @@ async fn run_console(
             event = event_rx.recv() => {
                 match event {
                     Ok(PeerEvent::StatusChange { peer, status }) => {
-                        println!("{peer}: {status}");
+                        tracing::info!("{peer}: {status}");
                     }
                     Ok(PeerEvent::LogEntry { peer, level, message }) => {
                         if level == "error" || level == "warn" {
-                            eprintln!("[{level}] {peer}: {message}");
+                            tracing::warn!("[{level}] {peer}: {message}");
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -532,13 +566,12 @@ async fn run_console(
             }
             // Branch 2: tick — send due commands and check completion
             _ = tick.tick() => {
-                send_due_batches(batches, &mut current_batch_idx, redis_conn, test_start, true).await;
+                send_due_batches(batches, &mut current_batch_idx, redis_conn, test_start).await;
 
                 // Auto-shutdown: once all commands are sent, send shutdown to all peers
                 if current_batch_idx >= batches.len() {
                     if !shutdown_sent {
                         tracing::info!("all commands sent, sending shutdown to all peers");
-                        println!("all commands sent, sending shutdown to all peers...");
                         orchestrator::shutdown_all_peers(peer_names, redis_conn).await;
                         shutdown_sent = true;
                         shutdown_started = Some(Instant::now());
@@ -551,15 +584,13 @@ async fn run_console(
                         })
                     };
                     if all_stopped {
-                        println!("all peers stopped — test complete");
                         tracing::info!("all commands sent and all peers stopped — test complete");
                         return Ok(());
                     }
 
                     if let Some(started) = shutdown_started {
                         if started.elapsed() > Duration::from_secs(config.timeout.shutdown) {
-                            println!("shutdown timeout exceeded ({}s), exiting", config.timeout.shutdown);
-                            tracing::warn!("shutdown timeout exceeded, exiting");
+                            tracing::warn!("shutdown timeout exceeded ({}s), exiting", config.timeout.shutdown);
                             return Ok(());
                         }
                     }
@@ -567,17 +598,16 @@ async fn run_console(
             }
             // Branch 3: shutdown signal
             _ = shutdown_token.cancelled() => {
-                println!("signal received, initiating shutdown...");
                 tracing::info!("signal received, initiating orderly shutdown");
                 orchestrator::shutdown_all_peers(peer_names, redis_conn).await;
-                println!("waiting up to {}s for peers to stop...", config.timeout.shutdown);
+                tracing::info!("waiting up to {}s for peers to stop...", config.timeout.shutdown);
                 match orchestrator::wait_for_peers_stopped(
                     state,
                     &peer_names.to_vec(),
                     Duration::from_secs(config.timeout.shutdown),
                 ).await {
-                    Ok(()) => println!("all peers stopped gracefully"),
-                    Err(e) => println!("shutdown timeout: {e} (force-stopping in cleanup)"),
+                    Ok(()) => tracing::info!("all peers stopped gracefully"),
+                    Err(e) => tracing::warn!("shutdown timeout: {e} (force-stopping in cleanup)"),
                 }
                 return Ok(());
             }
@@ -622,13 +652,6 @@ async fn cleanup(
     // Stop Redis (only if we started it)
     if let Some(mgr) = redis_mgr {
         let _ = mgr.stop();
-    }
-}
-
-/// Print a message to stdout when in console mode.
-fn console_print(console_mode: bool, msg: &str) {
-    if console_mode {
-        println!("{msg}");
     }
 }
 

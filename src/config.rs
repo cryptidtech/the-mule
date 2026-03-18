@@ -3,6 +3,28 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub fn as_filter_str(&self) -> &str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
 #[derive(Deserialize, Clone)]
 pub struct TestConfig {
     pub name: String,
@@ -18,6 +40,8 @@ pub struct TestConfig {
     pub hosts: Vec<HostConfig>,
     pub peers: Vec<PeerConfig>,
     pub commands: Vec<TestCommand>,
+    #[serde(default)]
+    pub log_level: Option<LogLevel>,
 }
 
 #[derive(Deserialize, Clone)]

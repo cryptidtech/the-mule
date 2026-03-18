@@ -15,6 +15,7 @@ This document describes the full YAML schema for `tm` test configuration files.
 | `hosts` | list of HostConfig | yes | Remote hosts to run peer containers on |
 | `peers` | list of PeerConfig | yes | Peer definitions (may be empty) |
 | `commands` | list of TestCommand | yes | Timed command sequence |
+| `log_level` | string | no | Log verbosity: "error", "warn", "info", "debug", or "trace" (default: "info") |
 
 ## RedisConfig
 
@@ -118,7 +119,6 @@ With tags — peers with `runs_on: [gpu]` are assigned only to hosts tagged `gpu
 | Flag | Description |
 |------|-------------|
 | `--tui` | Enable the ratatui TUI interface (default: console mode) |
-| `--verbose` | Print tracing log output to stderr (console mode only) |
 | `--redis-url <URL>` | Use an external Redis instance instead of starting one |
 | `--reset-hosts` | Connect to all hosts, remove Docker images listed in `images`, then exit |
 | `--reset-hosts-all` | Connect to all hosts, run `docker system prune -af`, then exit |
@@ -130,6 +130,8 @@ With tags — peers with `runs_on: [gpu]` are assigned only to hosts tagged `gpu
 
 ```yaml
 name: "smoke-test-5peer"
+
+log_level: info
 
 timeout:
   startup: 60

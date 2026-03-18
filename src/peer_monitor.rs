@@ -146,25 +146,34 @@ pub async fn monitor_peer(
             result = blpop(&mut blpop_conn, &log_key, 0) => {
                 if let Ok(Some((_key, log_entry))) = result {
                     if let Some((level, message)) = log_entry.split_once('|') {
-                        match level {
-                            "error" => tracing::error!(peer = %peer_name, "{message}"),
-                            "warn"  => tracing::warn!(peer = %peer_name, "{message}"),
-                            "info"  => tracing::info!(peer = %peer_name, "{message}"),
-                            "debug" => tracing::debug!(peer = %peer_name, "{message}"),
-                            _       => tracing::trace!(peer = %peer_name, "{message}"),
+                        let parsed_level = match level.to_ascii_lowercase().as_str() {
+                            "error" => tracing::Level::ERROR,
+                            "warn"  => tracing::Level::WARN,
+                            "info"  => tracing::Level::INFO,
+                            "debug" => tracing::Level::DEBUG,
+                            "trace" => tracing::Level::TRACE,
+                            _       => tracing::Level::TRACE,
+                        };
+                        match parsed_level {
+                            tracing::Level::ERROR => tracing::error!(peer = %peer_name, "{message}"),
+                            tracing::Level::WARN  => tracing::warn!(peer = %peer_name, "{message}"),
+                            tracing::Level::INFO  => tracing::info!(peer = %peer_name, "{message}"),
+                            tracing::Level::DEBUG => tracing::debug!(peer = %peer_name, "{message}"),
+                            tracing::Level::TRACE => tracing::trace!(peer = %peer_name, "{message}"),
                         }
 
+                        let canonical_level = parsed_level.as_str().to_ascii_lowercase();
                         let mut state = state.lock().await;
                         state.logs.push((
                             peer_name.clone(),
-                            level.to_string(),
+                            canonical_level.clone(),
                             message.to_string(),
                         ));
 
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(PeerEvent::LogEntry {
                                 peer: peer_name.clone(),
-                                level: level.to_string(),
+                                level: canonical_level,
                                 message: message.to_string(),
                             });
                         }
