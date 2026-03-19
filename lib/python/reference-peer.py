@@ -34,7 +34,7 @@ async def main() -> None:
     await client.send_status(f"started|/ip4/{ip}/udp/{port}/quic-v1")
 
     async for command in client:
-        logging.info(f"received command: {command}")
+        logging.info(f"{command}")
         if command == "shutdown":
             await client.send_status("stopped")
             break

@@ -49,7 +49,7 @@ func main() {
 	}
 
 	for cmd := range client.Commands() {
-		slog.Info("received command", "command", cmd)
+		slog.Info(cmd)
 
 		if cmd == "shutdown" {
 			_ = client.SendStatus(ctx, "stopped")

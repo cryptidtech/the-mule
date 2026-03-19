@@ -88,6 +88,13 @@ pub fn new_progress_bar(multi: &MultiProgress, total: u64, msg: &str) -> Progres
     pb
 }
 
+/// Clear a batch of finished spinners from the terminal.
+pub fn clear_spinners(spinners: &[ProgressBar]) {
+    for pb in spinners {
+        pb.finish_and_clear();
+    }
+}
+
 /// Custom tracing event formatter that detects peer-related structured fields
 /// and formats them with direction indicators.
 ///
@@ -95,15 +102,23 @@ pub fn new_progress_bar(multi: &MultiProgress, total: u64, msg: &str) -> Progres
 /// - `[alice]< stopped`       — status change (peer_name + direction "<")
 /// - `[alice]> [0.0s] connect` — command send (peer_name + direction ">")
 /// - `[alice]: [warn] msg`     — log entry (peer_name + direction ":")
-/// - `[alice] message`         — peer log from peer_monitor (peer field)
+/// - `[alice]: message`        — peer log from peer_monitor (peer field)
 /// - `tm: message`             — non-peer message (uses target)
 pub struct PeerAwareFormatter {
     ansi: bool,
+    prefix_width: usize,
 }
 
 impl PeerAwareFormatter {
     pub fn new(ansi: bool) -> Self {
-        Self { ansi }
+        Self { ansi, prefix_width: 0 }
+    }
+
+    pub fn with_peer_names(ansi: bool, peer_names: &[crate::config::PeerName]) -> Self {
+        let max_name_len = peer_names.iter().map(|n| n.as_str().len()).max().unwrap_or(0);
+        // prefix = "[" + name + "]" + direction_char + " " = name.len() + 4
+        let prefix_width = if max_name_len > 0 { max_name_len + 4 } else { 0 };
+        Self { ansi, prefix_width }
     }
 }
 
@@ -186,11 +201,23 @@ where
         // Format based on which fields are present
         if let Some(ref peer) = visitor.peer {
             // Peer log from peer_monitor (peer field contains "[alice]" via Display)
-            writeln!(writer, "{peer} {}", visitor.message)?;
+            let prefix = format!("{peer}: ");
+            if self.prefix_width > 0 {
+                write!(writer, "{:<width$}", prefix, width = self.prefix_width)?;
+            } else {
+                write!(writer, "{}", prefix)?;
+            }
+            writeln!(writer, "{}", visitor.message)?;
         } else if let Some(ref peer_name) = visitor.peer_name {
             // Status change or command send from main.rs
             let direction = visitor.direction.as_deref().unwrap_or(":");
-            writeln!(writer, "[{peer_name}]{direction} {}", visitor.message)?;
+            let prefix = format!("[{peer_name}]{direction} ");
+            if self.prefix_width > 0 {
+                write!(writer, "{:<width$}", prefix, width = self.prefix_width)?;
+            } else {
+                write!(writer, "{}", prefix)?;
+            }
+            writeln!(writer, "{}", visitor.message)?;
         } else {
             // Non-peer message — use target
             let target = event.metadata().target();

@@ -64,7 +64,7 @@ async fn main() {
                 std::process::exit(42);
             }
             Some(cmd) => {
-                tracing::info!("received command: {:?}", cmd);
+                tracing::info!("{}", cmd);
             }
             None => break,
         }

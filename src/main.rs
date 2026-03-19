@@ -106,6 +106,9 @@ async fn main() -> Result<()> {
     );
     let log_file = File::create(&log_filename).context("failed to create log file")?;
 
+    // Compute peer names early for formatter column alignment
+    let peer_names: Vec<PeerName> = config.peers.iter().map(|p| p.name.clone()).collect();
+
     // Build log level filter from config (default: info)
     let filter_str = config
         .log_level
@@ -117,12 +120,12 @@ async fn main() -> Result<()> {
     // Configure tracing — file layer always present, console layer in console mode
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(log_file)
-        .event_format(console::PeerAwareFormatter::new(false));
+        .event_format(console::PeerAwareFormatter::with_peer_names(false, &peer_names));
 
     if let Some(ref m) = multi {
         let console_layer = tracing_subscriber::fmt::layer()
             .with_writer(console::IndicatifMakeWriter::new(m.clone()))
-            .event_format(console::PeerAwareFormatter::new(true));
+            .event_format(console::PeerAwareFormatter::with_peer_names(true, &peer_names));
         tracing_subscriber::registry()
             .with(file_layer)
             .with(console_layer)
@@ -134,6 +137,8 @@ async fn main() -> Result<()> {
             .with(env_filter)
             .init();
     }
+
+    let program_start = Instant::now();
 
     tracing::info!(
         "Test started at {}, config: {}",
@@ -209,17 +214,27 @@ async fn main() -> Result<()> {
     if let Some(ref s) = ssh_spinner {
         s.finish_with_message(format!("connected to {} host(s)", ssh_managers.len()));
     }
-
-    // Pre-pull images listed in the config
-    if !config.images.is_empty() {
-        docker_mgr::pull_images(&config.images, multi.as_ref())?;
+    // Clear SSH phase spinners
+    if let Some(s) = ssh_spinner {
+        s.finish_and_clear();
     }
 
-    // Distribute Docker images to hosts (async, maximally parallel)
-    docker_mgr::distribute_all_images(&assignments, &ssh_connect_infos, multi.as_ref()).await?;
+    // Pre-pull images listed in the config
+    let pull_spinners = if !config.images.is_empty() {
+        docker_mgr::pull_images(&config.images, multi.as_ref())?
+    } else {
+        Vec::new()
+    };
 
-    // Phase 3: Clear stale Redis queues and start peer containers
-    let clear_spinner = multi.as_ref().map(|m| console::new_spinner(m, "clearing stale Redis queues..."));
+    // Distribute Docker images to hosts (async, maximally parallel)
+    let dist_pbs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    docker_mgr::distribute_all_images(&assignments, &ssh_connect_infos, multi.as_ref(), Some(&dist_pbs)).await?;
+
+    // Clear pull + distribute phase spinners
+    console::clear_spinners(&pull_spinners);
+    console::clear_spinners(&dist_pbs.lock().unwrap());
+
+    // Clear stale Redis queues
     for assignment in &assignments {
         let command_key = format!("{}_command", assignment.peer_name.as_str());
         let log_key = format!("{}_log", assignment.peer_name.as_str());
@@ -230,9 +245,7 @@ async fn main() -> Result<()> {
             .await
             .context(format!("failed to DEL {log_key}"))?;
     }
-    if let Some(ref s) = clear_spinner {
-        s.finish_with_message("cleared stale Redis queues");
-    }
+    tracing::info!("cleared stale Redis queues");
 
     // Start peer containers with per-peer spinners
     let peer_spinners: Vec<_> = assignments
@@ -264,11 +277,8 @@ async fn main() -> Result<()> {
     }
 
     // Give containers a moment to initialize before spawning BLPOP monitors
-    let init_spinner = multi.as_ref().map(|m| console::new_spinner(m, "waiting for containers to initialize..."));
     tokio::time::sleep(Duration::from_secs(2)).await;
-    if let Some(ref s) = init_spinner {
-        s.finish_with_message("containers initialized");
-    }
+    tracing::info!("containers initialized");
 
     // Shared state for peer statuses and identity info
     let state = Arc::new(Mutex::new(PeerState::new()));
@@ -282,7 +292,6 @@ async fn main() -> Result<()> {
     };
 
     // Spawn per-peer monitor tasks
-    let peer_names: Vec<PeerName> = config.peers.iter().map(|p| p.name.clone()).collect();
     let mut monitor_handles = Vec::new();
     for name in &peer_names {
         let handle = tokio::spawn(peer_monitor::monitor_peer(
@@ -322,9 +331,12 @@ async fn main() -> Result<()> {
         anyhow::bail!("peer startup failed: {e}");
     }
     tracing::info!("all peers started successfully");
-    if let Some(ref s) = start_spinner {
-        s.finish_with_message("all peers started");
+    if let Some(s) = start_spinner {
+        s.finish_and_clear();
     }
+    // Clear peer start spinners now that all peers are started
+    let started_pbs: Vec<_> = peer_spinners.into_iter().filter_map(|s| s).collect();
+    console::clear_spinners(&started_pbs);
 
     // Send bootstrap peer commands
     orchestrator::send_bootstrap_commands(&config, &state, &mut redis_conn)
@@ -377,7 +389,24 @@ async fn main() -> Result<()> {
     )
     .await;
 
+    println!("test {} completed: {}", config.name, format_duration(program_start.elapsed()));
+
     result
+}
+
+fn format_duration(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if hours > 0 {
+        format!("{}h {}m {}s", hours, minutes, seconds)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    }
 }
 
 /// Send any due command batches, returning the updated batch index.

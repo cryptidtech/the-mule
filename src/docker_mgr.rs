@@ -345,10 +345,12 @@ async fn plan_distribution(
 }
 
 /// Phase 2: Export images and transfer/import to missing hosts in parallel.
+/// Collects finished progress bars into `collected_pbs` (if provided) so the caller can clear them.
 async fn distribute_images(
     plans: Vec<ImagePlan>,
     ssh_connect_infos: &HashMap<String, SshConnectInfo>,
     multi: Option<&Arc<MultiProgress>>,
+    collected_pbs: Option<&Arc<std::sync::Mutex<Vec<ProgressBar>>>>,
 ) -> Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
 
@@ -360,6 +362,9 @@ async fn distribute_images(
         let image = plan.image.clone();
         let archive_path = plan.archive_path.clone();
         let export_pb = multi.map(|m| console::new_progress_bar(m, 0, &format!("exporting {image}")));
+        if let (Some(ref pb), Some(ref collected)) = (&export_pb, &collected_pbs) {
+            collected.lock().unwrap().push(pb.clone());
+        }
         join_set.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 export_image_blocking(&image, &archive_path, export_pb)
@@ -385,6 +390,9 @@ async fn distribute_images(
             let transfer_pb = multi.map(|m| {
                 console::new_progress_bar(m, 0, &format!("{host_display}: transferring {image_name}"))
             });
+            if let (Some(ref pb), Some(ref collected)) = (&transfer_pb, &collected_pbs) {
+                collected.lock().unwrap().push(pb.clone());
+            }
 
             join_set.spawn(async move {
                 // Wait for export to complete
@@ -448,6 +456,7 @@ pub async fn distribute_all_images(
     assignments: &[PeerAssignment],
     ssh_connect_infos: &HashMap<String, SshConnectInfo>,
     multi: Option<&Arc<MultiProgress>>,
+    collected_pbs: Option<&Arc<std::sync::Mutex<Vec<ProgressBar>>>>,
 ) -> Result<()> {
     // Derive unique (image, set_of_hosts) from assignments
     let mut image_hosts: HashMap<String, HashSet<String>> = HashMap::new();
@@ -483,7 +492,7 @@ pub async fn distribute_all_images(
     );
 
     // Phase 2: export → transfer → import pipeline
-    distribute_images(plans, ssh_connect_infos, multi).await?;
+    distribute_images(plans, ssh_connect_infos, multi, collected_pbs).await?;
 
     tracing::info!("Docker image distribution complete");
 
@@ -491,7 +500,9 @@ pub async fn distribute_all_images(
 }
 
 /// Pull a list of Docker images locally. Bails on the first failure.
-pub fn pull_images(images: &[String], multi: Option<&Arc<MultiProgress>>) -> Result<()> {
+/// Returns finished spinners so the caller can clear them between phases.
+pub fn pull_images(images: &[String], multi: Option<&Arc<MultiProgress>>) -> Result<Vec<ProgressBar>> {
+    let mut spinners = Vec::new();
     for image in images {
         let spinner = multi.map(|m| console::new_spinner(m, &format!("pulling {image}...")));
         tracing::info!("pulling Docker image: {image}");
@@ -512,9 +523,12 @@ pub fn pull_images(images: &[String], multi: Option<&Arc<MultiProgress>>) -> Res
         if let Some(ref s) = spinner {
             s.finish_with_message(format!("pulled {image}"));
         }
+        if let Some(s) = spinner {
+            spinners.push(s);
+        }
         tracing::info!("pulled Docker image: {image}");
     }
-    Ok(())
+    Ok(spinners)
 }
 
 /// Start a peer container on its assigned remote host via SSH.

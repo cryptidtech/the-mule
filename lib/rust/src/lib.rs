@@ -41,6 +41,19 @@ pub enum Command {
     Test(String),
 }
 
+impl std::fmt::Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Command::Connect => write!(f, "connect"),
+            Command::Disconnect => write!(f, "disconnect"),
+            Command::Shutdown => write!(f, "shutdown"),
+            Command::Restart { delay_secs } => write!(f, "restart|{delay_secs}"),
+            Command::Peer { multiaddr } => write!(f, "peer|{multiaddr}"),
+            Command::Test(raw) => write!(f, "{raw}"),
+        }
+    }
+}
+
 impl Command {
     /// Parse a raw pipe-delimited command string from Redis.
     pub fn parse(raw: &str) -> Self {
@@ -110,7 +123,6 @@ impl MuleClientBuilder {
         let (log_tx, mut log_rx) = mpsc::channel::<String>(1024);
         let log_layer = RedisLogLayer {
             sender: log_tx,
-            peer_name: peer_name.clone(),
         };
 
         let env_filter = tracing_subscriber::EnvFilter::from_default_env();
@@ -203,7 +215,6 @@ impl Stream for MuleClient {
 /// A tracing layer that forwards log events to Redis.
 struct RedisLogLayer {
     sender: mpsc::Sender<String>,
-    peer_name: String,
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RedisLogLayer {
@@ -228,7 +239,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RedisLogLayer {
             visitor.0
         };
 
-        let entry = format!("{level}|[{}] {message}", self.peer_name);
+        let entry = format!("{level}|{message}");
         let _ = self.sender.try_send(entry);
     }
 }
